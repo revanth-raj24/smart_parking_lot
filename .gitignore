@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Build artifacts
+*.log
+
+# Captured images (large binary files)
+backend/captured_images/*.jpg
+backend/captured_images/*.jpeg
+backend/captured_images/*.png
+
+# IDE
+.vscode/
+.idea/
+
+Claude/
