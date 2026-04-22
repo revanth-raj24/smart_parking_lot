@@ -4,7 +4,16 @@ const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('user')) } catch { return null }
+    try {
+      const stored = JSON.parse(localStorage.getItem('user'))
+      // Admin tokens must never live in the user app — clear on load if found
+      if (stored?.is_admin) {
+        localStorage.removeItem('token')
+        localStorage.removeItem('user')
+        return null
+      }
+      return stored
+    } catch { return null }
   })
 
   const saveAuth = useCallback((token, userData) => {

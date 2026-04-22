@@ -1,9 +1,10 @@
 import uuid
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, File, UploadFile, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.database import get_db
 from app.models.vehicle import Vehicle
 from app.models.parking_slot import ParkingSlot, SlotStatus
@@ -11,11 +12,21 @@ from app.models.parking_session import ParkingSession, SessionStatus
 from app.models.wallet import Wallet
 from app.models.transaction import Transaction, TransactionType, TransactionStatus
 from app.schemas.parking import ESP32EventResponse
-from app.services.ocr import extract_license_plate, save_captured_image, OCRFailedException
+from app.services.ocr import extract_license_plate, flip_image_horizontal, save_captured_image, OCRFailedException
 from app.services.billing import calculate_parking_cost
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB hard limit
+
+
+def _save_image_safe(image_bytes: bytes, filename: str) -> None:
+    """Wrapper used as a BackgroundTask — logs errors instead of raising."""
+    try:
+        save_captured_image(image_bytes, filename)
+    except Exception as exc:
+        logger.error(f"[IMAGE] Background save failed ({filename}): {exc}")
 
 
 def _first_available_slot(db: Session) -> ParkingSlot | None:
@@ -29,19 +40,30 @@ def _first_available_slot(db: Session) -> ParkingSlot | None:
 
 @router.post("/entry-event", response_model=ESP32EventResponse)
 async def entry_event(
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     image_bytes = await image.read()
+
+    if len(image_bytes) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds 10 MB limit")
+
     timestamp = datetime.now(timezone.utc)
     filename = f"entry_{timestamp.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
+    image_path = f"{settings.CAPTURED_IMAGES_DIR}/{filename}"
 
-    image_path = save_captured_image(image_bytes, filename)
-    logger.info(f"[ENTRY] Image saved: {image_path}")
+    logger.info(f"[ENTRY] Image received: {filename} ({len(image_bytes)} bytes)")
 
-    # OCR
+    # Entry-gate camera produces a mirrored image — correct before OCR and save
+    image_bytes = flip_image_horizontal(image_bytes)
+
+    # Save corrected image after the response is sent — keeps it off the critical path.
+    background_tasks.add_task(_save_image_safe, image_bytes, filename)
+
+    # OCR — async, does not block the event loop
     try:
-        plate = extract_license_plate(image_bytes)
+        plate = await extract_license_plate(image_bytes)
     except OCRFailedException as exc:
         logger.error(f"[ENTRY] OCR failed: {exc}")
         db.add(ParkingSession(
@@ -57,7 +79,11 @@ async def entry_event(
     logger.info(f"[ENTRY] Plate: {plate}")
 
     # Vehicle lookup
-    vehicle = db.query(Vehicle).filter(Vehicle.license_plate == plate, Vehicle.is_active == True).first()
+    vehicle = (
+        db.query(Vehicle)
+        .filter(Vehicle.license_plate == plate, Vehicle.is_active == True)  # noqa: E712
+        .first()
+    )
     if not vehicle:
         db.add(ParkingSession(
             license_plate_raw=plate,
@@ -71,14 +97,18 @@ async def entry_event(
         return ESP32EventResponse(
             status="DENY",
             license_plate=plate,
-            message=f"Vehicle {plate} is not registered. Please register at the kiosk.",
+            message=f"Vehicle {plate} is not registered in the system.",
         )
 
-    # Check for existing active session
-    existing_session = db.query(ParkingSession).filter(
-        ParkingSession.vehicle_id == vehicle.id,
-        ParkingSession.status == SessionStatus.ACTIVE,
-    ).first()
+    # Prevent double-entry for the same vehicle
+    existing_session = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.vehicle_id == vehicle.id,
+            ParkingSession.status == SessionStatus.ACTIVE,
+        )
+        .first()
+    )
     if existing_session:
         return ESP32EventResponse(
             status="DENY",
@@ -104,7 +134,7 @@ async def entry_event(
             message="Parking lot is full",
         )
 
-    # Assign slot and create session
+    # Assign slot and open session
     slot.status = SlotStatus.OCCUPIED
     slot.updated_at = timestamp
 
@@ -130,39 +160,73 @@ async def entry_event(
 
 @router.post("/exit-event", response_model=ESP32EventResponse)
 async def exit_event(
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     image_bytes = await image.read()
+
+    if len(image_bytes) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image exceeds 10 MB limit")
+
     timestamp = datetime.now(timezone.utc)
     filename = f"exit_{timestamp.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
+    image_path = f"{settings.CAPTURED_IMAGES_DIR}/{filename}"
 
-    image_path = save_captured_image(image_bytes, filename)
-    logger.info(f"[EXIT] Image saved: {image_path}")
+    logger.info(f"[EXIT] Image received: {filename} ({len(image_bytes)} bytes)")
+
+    # Exit-gate camera produces a mirrored image — correct before OCR and save
+    image_bytes = flip_image_horizontal(image_bytes)
+
+    background_tasks.add_task(_save_image_safe, image_bytes, filename)
+
+    def _deny_exit(plate: str, reason: str, **extra):
+        """Create a DENIED session record so every exit capture has a DB row."""
+        db.add(ParkingSession(
+            license_plate_raw=plate,
+            entry_time=timestamp,
+            exit_time=timestamp,
+            status=SessionStatus.DENIED,
+            exit_image_path=image_path,
+            deny_reason=reason,
+            **extra,
+        ))
+        db.commit()
 
     # OCR
     try:
-        plate = extract_license_plate(image_bytes)
+        plate = await extract_license_plate(image_bytes)
     except OCRFailedException as exc:
         logger.error(f"[EXIT] OCR failed: {exc}")
+        _deny_exit("UNKNOWN", f"OCR failure: {exc}")
         return ESP32EventResponse(status="DENY", message="OCR failed — please use manual exit")
 
     logger.info(f"[EXIT] Plate: {plate}")
 
-    # Find active session
-    vehicle = db.query(Vehicle).filter(Vehicle.license_plate == plate, Vehicle.is_active == True).first()
+    # Vehicle and session lookup
+    vehicle = (
+        db.query(Vehicle)
+        .filter(Vehicle.license_plate == plate, Vehicle.is_active == True)  # noqa: E712
+        .first()
+    )
     if not vehicle:
+        _deny_exit(plate, "Unregistered vehicle")
         return ESP32EventResponse(
             status="DENY",
             license_plate=plate,
             message=f"Vehicle {plate} not found in system",
         )
 
-    session = db.query(ParkingSession).filter(
-        ParkingSession.vehicle_id == vehicle.id,
-        ParkingSession.status == SessionStatus.ACTIVE,
-    ).first()
+    session = (
+        db.query(ParkingSession)
+        .filter(
+            ParkingSession.vehicle_id == vehicle.id,
+            ParkingSession.status == SessionStatus.ACTIVE,
+        )
+        .first()
+    )
     if not session:
+        _deny_exit(plate, "No active session found", vehicle_id=vehicle.id)
         return ESP32EventResponse(
             status="DENY",
             license_plate=plate,
@@ -175,8 +239,9 @@ async def exit_event(
 
     # Wallet check
     wallet = db.query(Wallet).filter(Wallet.user_id == vehicle.user_id).first()
-    if not wallet or wallet.balance < cost:
-        current_balance = wallet.balance if wallet else 0.0
+    current_balance = float(wallet.balance) if wallet else 0.0
+    if not wallet or current_balance < cost:
+        _deny_exit(plate, f"Insufficient balance (need ₹{cost:.2f}, have ₹{current_balance:.2f})", vehicle_id=vehicle.id)
         return ESP32EventResponse(
             status="DENY",
             license_plate=plate,
@@ -185,16 +250,19 @@ async def exit_event(
             message=f"Insufficient balance. Required: ₹{cost:.2f}, Available: ₹{current_balance:.2f}",
         )
 
-    # Deduct and close session
-    wallet.balance = round(wallet.balance - cost, 2)
+    # Deduct balance
+    wallet.balance = round(current_balance - cost, 2)
     wallet.updated_at = timestamp
 
+    # Close session
     session.exit_time = timestamp
     session.duration_minutes = duration_minutes
     session.cost = cost
     session.status = SessionStatus.COMPLETED
     session.exit_image_path = image_path
 
+    # Free the slot — initialized to None so the Transaction description is always safe
+    slot = None
     if session.slot_id:
         slot = db.query(ParkingSlot).filter(ParkingSlot.id == session.slot_id).first()
         if slot:
@@ -214,12 +282,13 @@ async def exit_event(
     db.add(txn)
     db.commit()
 
-    logger.info(f"[EXIT] ALLOW — plate={plate}, cost=₹{cost}, balance=₹{wallet.balance}")
+    new_balance = float(wallet.balance)
+    logger.info(f"[EXIT] ALLOW — plate={plate}, cost=₹{cost}, balance=₹{new_balance}")
     return ESP32EventResponse(
         status="ALLOW",
         license_plate=plate,
         session_id=session.id,
         cost=cost,
-        wallet_balance=wallet.balance,
-        message=f"₹{cost:.2f} deducted. Remaining balance: ₹{wallet.balance:.2f}. Safe drive!",
+        wallet_balance=new_balance,
+        message=f"₹{cost:.2f} deducted. Remaining balance: ₹{new_balance:.2f}. Safe drive!",
     )

@@ -1,6 +1,10 @@
 """
 Run with: python -m app.db.seed
 Seeds: default admin account + 11 parking slots
+
+Credentials are read from environment variables:
+  ADMIN_SEED_EMAIL    (default: admin@smartpark.com)
+  ADMIN_SEED_PASSWORD (default: admin123 — change before production)
 """
 import sys
 import os
@@ -12,6 +16,9 @@ from app.models import User, ParkingSlot, Wallet
 from app.core.security import hash_password
 from datetime import datetime, timezone
 
+_ADMIN_EMAIL    = os.environ.get("ADMIN_SEED_EMAIL",    "admin@smartpark.com")
+_ADMIN_PASSWORD = os.environ.get("ADMIN_SEED_PASSWORD", "admin123")
+
 
 def seed():
     Base.metadata.create_all(bind=engine)
@@ -19,12 +26,12 @@ def seed():
 
     try:
         # --- Admin account ---
-        existing_admin = db.query(User).filter(User.email == "admin@smartpark.com").first()
+        existing_admin = db.query(User).filter(User.email == _ADMIN_EMAIL).first()
         if not existing_admin:
             admin = User(
                 name="Admin",
-                email="admin@smartpark.com",
-                hashed_password=hash_password("admin123"),
+                email=_ADMIN_EMAIL,
+                hashed_password=hash_password(_ADMIN_PASSWORD),
                 phone="9999999999",
                 is_active=True,
                 is_admin=True,
@@ -40,7 +47,8 @@ def seed():
                 updated_at=datetime.now(timezone.utc),
             )
             db.add(admin_wallet)
-            print("[SEED] Admin account created: admin@smartpark.com / admin123")
+            print(f"[SEED] Admin account created: {_ADMIN_EMAIL}")
+            print("[SEED] Set ADMIN_SEED_PASSWORD env var to configure the password before production.")
         else:
             print("[SEED] Admin account already exists — skipping")
 

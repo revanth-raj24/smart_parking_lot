@@ -16,9 +16,15 @@ export default function Login() {
     setLoading(true)
     try {
       const { data } = await login(form)
+      if (data.user.is_admin) {
+        const adminUrl = import.meta.env.VITE_ADMIN_APP_URL || 'http://localhost:5174'
+        toast.success('Admin detected — redirecting to admin portal…')
+        setTimeout(() => window.location.replace(adminUrl), 800)
+        return
+      }
       saveAuth(data.access_token, data.user)
       toast.success(`Welcome back, ${data.user.name}!`)
-      navigate(data.user.is_admin ? '/admin' : '/dashboard', { replace: true })
+      navigate('/dashboard', { replace: true })
     } catch (err) {
       toast.error(err.response?.data?.detail || 'Login failed')
     } finally {

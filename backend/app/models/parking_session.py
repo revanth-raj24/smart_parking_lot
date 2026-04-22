@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
@@ -12,6 +12,10 @@ class SessionStatus:
 
 class ParkingSession(Base):
     __tablename__ = "parking_sessions"
+    # Composite index covers the (vehicle_id, status) filter used on every entry/exit
+    __table_args__ = (
+        Index("ix_parking_sessions_vehicle_status", "vehicle_id", "status"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     vehicle_id: Mapped[int] = mapped_column(Integer, ForeignKey("vehicles.id"), nullable=True)
@@ -23,7 +27,7 @@ class ParkingSession(Base):
     exit_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_minutes: Mapped[float] = mapped_column(Float, nullable=True)
     cost: Mapped[float] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default=SessionStatus.ACTIVE, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default=SessionStatus.ACTIVE, nullable=False, index=True)
     entry_image_path: Mapped[str] = mapped_column(String(255), nullable=True)
     exit_image_path: Mapped[str] = mapped_column(String(255), nullable=True)
     deny_reason: Mapped[str] = mapped_column(Text, nullable=True)

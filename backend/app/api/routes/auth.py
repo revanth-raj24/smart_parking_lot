@@ -34,7 +34,7 @@ def register(payload: UserRegister, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    token = create_access_token({"sub": str(user.id)})
+    token = create_access_token({"sub": str(user.id), "role": "user"})
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 
@@ -46,7 +46,8 @@ def login(payload: UserLogin, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
-    token = create_access_token({"sub": str(user.id)})
+    role = "admin" if user.is_admin else "user"
+    token = create_access_token({"sub": str(user.id), "role": role})
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
 

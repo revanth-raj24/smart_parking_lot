@@ -16,7 +16,8 @@ class ParkingSlot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     slot_number: Mapped[str] = mapped_column(String(10), unique=True, nullable=False)
-    status: Mapped[str] = mapped_column(String(20), default=SlotStatus.AVAILABLE, nullable=False)
+    # Indexed: queried on every entry event to find the first available slot
+    status: Mapped[str] = mapped_column(String(20), default=SlotStatus.AVAILABLE, nullable=False, index=True)
     floor: Mapped[str] = mapped_column(String(10), default="G")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
