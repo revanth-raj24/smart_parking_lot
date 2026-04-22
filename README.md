@@ -25,7 +25,7 @@ Vehicles are identified at entry and exit by ESP32-CAM modules. A vision LLM rea
 ┌─────────────────┐        HTTP POST (image)       ┌──────────────────────┐
 │  Entry ESP32-CAM│ ──────────────────────────────► │                      │
 │  (IR + Servo)   │ ◄────── ALLOW / DENY ────────── │   FastAPI Backend    │
-└─────────────────┘                                  │   (Python + MySQL)   │
+└─────────────────┘                                  │   (Python + SQLite)  │
                                                      │                      │
 ┌─────────────────┐        HTTP POST (image)         │  • OCR via OpenRouter│
 │  Exit ESP32-CAM │ ──────────────────────────────► │  • JWT auth          │
@@ -48,14 +48,14 @@ Vehicles are identified at entry and exit by ESP32-CAM modules. A vision LLM rea
 
 | Layer | Technology |
 |---|---|
-| Backend | FastAPI, SQLAlchemy 2, Alembic, PyMySQL |
+| Backend | FastAPI, SQLAlchemy 2, Alembic, SQLite |
 | Auth | JWT (python-jose), bcrypt |
 | OCR | OpenRouter API (`google/gemini-2.5-flash-lite`) via openai SDK |
 | Image processing | Pillow |
 | Frontend (user) | React 18, Vite, Tailwind CSS, Axios |
 | Frontend (admin) | React 18, Vite, Tailwind CSS, Axios |
 | Hardware | ESP32-CAM (AI-Thinker), SG90 Servo, IR sensor |
-| Production | Nginx, PM2, MySQL 8, Ubuntu VPS |
+| Production | Nginx, PM2, Ubuntu VPS |
 
 ---
 
@@ -97,7 +97,6 @@ smart-parking/
 
 - Python 3.11+
 - Node.js 20 LTS
-- MySQL 8
 - Arduino IDE (for firmware flashing)
 
 ### 1. Clone the repo
@@ -155,7 +154,7 @@ Default admin credentials (set via `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD` in
 
 | Variable | Description |
 |---|---|
-| `DATABASE_URL` | MySQL connection string |
+| `DATABASE_URL` | SQLite database path (e.g., `sqlite:///./smart_parking.db`) |
 | `SECRET_KEY` | JWT signing key — generate with `openssl rand -hex 32` |
 | `ALGORITHM` | JWT algorithm (default: `HS256`) |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token TTL (default: `1440` = 24 h) |
@@ -203,7 +202,7 @@ Required libraries (Arduino Library Manager):
 sudo bash deployment/deploy.sh
 ```
 
-The script installs dependencies, sets up MySQL, builds both React apps, runs migrations, seeds the database, and starts the backend under PM2 with Nginx as the reverse proxy.
+The script installs dependencies, builds both React apps, runs migrations, seeds the database, and starts the backend under PM2 with Nginx as the reverse proxy.
 
 **Before running:**
 1. Copy your project to `/var/www/smart-parking/`
