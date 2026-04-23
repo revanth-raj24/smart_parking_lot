@@ -1,36 +1,30 @@
 """
-IoT master routes — Server-as-master / ESP32-as-slave architecture (v5.0).
+IoT routes — Push-based architecture (v6.0).
 
 Flow per event:
   1. ESP32 boots → POST /api/devices/register  (upserts device_id + current DHCP IP)
   2. ESP32 sends heartbeat every 20 s → POST /api/devices/heartbeat
-  3. IR fires   → ESP32 POSTs /api/iot/trigger  (lightweight — no image payload)
-  4. Server     → returns 202 Accepted immediately
-  5. Background → server GETs  http://<db_ip>/capture  (pulls JPEG from slave)
-  6. Background → server runs OCR + parking business logic
-  7. Background → server POSTs http://<db_ip>/gate  {"action": "open"|"close"}
-  8. ESP32      → controls servo, auto-closes after timeout
+  3. IR fires   → ESP32 captures JPEG → POST /api/iot/trigger (multipart: device_id + image)
+  4. Server     → runs OCR + parking business logic synchronously
+  5. Server     → responds 200 {"action": "open"|"close"}
+  6. ESP32      → reads action, controls servo locally, auto-closes after timeout
 
-Device IPs are looked up from the `devices` DB table — never from static config.
+No server-initiated callbacks — eliminates NAT traversal issues when ESP32 is on LAN.
 """
 
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 
-import asyncio
-import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal, get_db
+from app.db.database import get_db
 from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.parking_session import ParkingSession, SessionStatus
 from app.models.wallet import Wallet
-from app.services.device_service import get_device_ip
 from app.services.ocr import (
     extract_license_plate,
     flip_image_horizontal,
@@ -51,58 +45,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ── Request / Response schemas ────────────────────────────────────────────────
-
-class DeviceTriggerRequest(BaseModel):
-    device_id: str
-    ip: Optional[str] = None   # optional: device may send current IP as a freshness hint
-
+# ── Response schema ───────────────────────────────────────────────────────────
 
 class TriggerAck(BaseModel):
     status: str
+    action: str   # "open" | "close" — ESP32 reads this to control the servo
     message: str
-
-
-# ── Master → Slave HTTP helpers ───────────────────────────────────────────────
-
-_CAPTURE_RETRIES = 4
-_CAPTURE_RETRY_DELAY_S = 0.5
-
-
-async def _fetch_image(ip: str, port: int) -> bytes:
-    """Server (master) pulls JPEG from slave's GET /capture. Retries on transient errors."""
-    url = f"http://{ip}:{port}/capture"
-    last_exc: Exception = RuntimeError("no attempts made")
-    async with httpx.AsyncClient(timeout=8.0) as client:
-        for attempt in range(1, _CAPTURE_RETRIES + 1):
-            try:
-                r = await client.get(url)
-                if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-                    logger.info(
-                        f"[IoT] Image fetched from {ip}:{port} — "
-                        f"{len(r.content)} bytes (attempt {attempt})"
-                    )
-                    return r.content
-                last_exc = RuntimeError(f"/capture returned HTTP {r.status_code}")
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(
-                    f"[IoT] /capture attempt {attempt}/{_CAPTURE_RETRIES} failed: {exc}"
-                )
-            if attempt < _CAPTURE_RETRIES:
-                await asyncio.sleep(_CAPTURE_RETRY_DELAY_S)
-    raise last_exc
-
-
-async def _command_gate(ip: str, port: int, action: str) -> None:
-    """Server (master) commands slave gate: action = 'open' | 'close'."""
-    url = f"http://{ip}:{port}/gate"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.post(url, json={"action": action})
-            logger.info(f"[IoT] Gate '{action}' → {ip}:{port} → HTTP {r.status_code}")
-    except Exception as exc:
-        logger.error(f"[IoT] Gate command '{action}' to {ip}:{port} failed: {exc}")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -110,106 +58,66 @@ async def _command_gate(ip: str, port: int, action: str) -> None:
 @router.post(
     "/trigger",
     response_model=TriggerAck,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Vehicle detected — server takes over from here",
+    status_code=status.HTTP_200_OK,
+    summary="Vehicle detected — ESP32 pushes image, server returns gate action",
 )
 async def device_trigger(
-    req: DeviceTriggerRequest,
-    background_tasks: BackgroundTasks,
+    device_id: str = Form(...),
+    image: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """
-    Lightweight notification from ESP32 — no image payload.
-    Server responds 202 immediately so ESP32 can return to handleClient()
-    before the server calls back for /capture and /gate.
-
-    Device IP is resolved from the `devices` DB table (populated by /api/devices/register).
-    If the device sends a fresher IP hint, we update the record in-place.
+    ESP32 pushes JPEG captured at IR-trigger time as multipart/form-data.
+    Server runs OCR + business logic synchronously and returns {"action":"open"|"close"}.
+    ESP32 reads the action and controls its own servo — no server-initiated callbacks needed.
     """
-    device = db.query(Device).filter(Device.device_id == req.device_id).first()
+    device = db.query(Device).filter(Device.device_id == device_id).first()
     if not device:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
-                f"Unknown device '{req.device_id}' — "
+                f"Unknown device '{device_id}' — "
                 "device must call POST /api/devices/register on boot first"
             ),
         )
 
-    # Accept an IP hint from the trigger payload (keeps record fresh between reboots)
-    if req.ip and req.ip != device.current_ip:
-        device.current_ip = req.ip
-        logger.info(f"[IoT] IP hint applied for {req.device_id}: {device.current_ip} → {req.ip}")
-
-    ip = device.current_ip
-    port = device.port
-    gate_type = device.device_type   # "entry_cam" | "exit_cam"
-
+    gate_type = device.device_type
     device.last_seen = datetime.now(timezone.utc)
     device.status = "online"
     db.commit()
 
-    logger.info(f"[IoT] Trigger — device={req.device_id}, ip={ip}:{port}, type={gate_type}")
-    background_tasks.add_task(_process_event, req.device_id, ip, port, gate_type)
-    return TriggerAck(status="processing", message="Trigger received — server is orchestrating")
+    logger.info(f"[IoT] Trigger — device={device_id}, type={gate_type}")
 
+    image_bytes = await image.read()
+    image_bytes = flip_image_horizontal(image_bytes)
 
-# ── Background: full event pipeline ──────────────────────────────────────────
+    timestamp = datetime.now(timezone.utc)
+    filename = (
+        f"{gate_type}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
+        f"_{uuid.uuid4().hex[:6]}.jpg"
+    )
+    image_path = f"{settings.CAPTURED_IMAGES_DIR}/{filename}"
 
-async def _process_event(device_id: str, ip: str, port: int, gate_type: str) -> None:
-    """
-    Runs after 202 is sent. Fully orchestrates the parking event:
-    fetch image → OCR → business logic → gate command.
-    Creates its own DB session (route session is closed by this point).
-    """
-    db = SessionLocal()
     try:
-        try:
-            image_bytes = await _fetch_image(ip, port)
-        except Exception as exc:
-            logger.error(f"[IoT] Cannot fetch image from {device_id}: {exc}")
-            await _command_gate(ip, port, "close")
-            return
-
-        image_bytes = flip_image_horizontal(image_bytes)
-
-        timestamp = datetime.now(timezone.utc)
-        filename = (
-            f"{gate_type}_{timestamp.strftime('%Y%m%d_%H%M%S')}"
-            f"_{uuid.uuid4().hex[:6]}.jpg"
-        )
-        image_path = f"{settings.CAPTURED_IMAGES_DIR}/{filename}"
-
-        try:
-            save_captured_image(image_bytes, filename)
-        except Exception as exc:
-            logger.warning(f"[IoT] Image save failed (non-fatal): {exc}")
-
-        try:
-            plate = await extract_license_plate(image_bytes)
-        except OCRFailedException as exc:
-            logger.error(f"[IoT] OCR failed for {device_id}: {exc}")
-            await _command_gate(ip, port, "close")
-            return
-
-        logger.info(f"[IoT] Plate detected: {plate}")
-
-        # entry_cam → entry handler, exit_cam → exit handler
-        if "entry" in gate_type:
-            allow = _handle_entry(db, plate, timestamp, image_path)
-        else:
-            allow = _handle_exit(db, plate, timestamp, image_path)
-
-        await _command_gate(ip, port, "open" if allow else "close")
-
+        save_captured_image(image_bytes, filename)
     except Exception as exc:
-        logger.exception(f"[IoT] Unhandled error in {device_id} event pipeline: {exc}")
-        try:
-            await _command_gate(ip, port, "close")
-        except Exception:
-            pass
-    finally:
-        db.close()
+        logger.warning(f"[IoT] Image save failed (non-fatal): {exc}")
+
+    try:
+        plate = await extract_license_plate(image_bytes)
+    except OCRFailedException as exc:
+        logger.error(f"[IoT] OCR failed for {device_id}: {exc}")
+        return TriggerAck(status="error", action="close", message="OCR failed")
+
+    logger.info(f"[IoT] Plate detected: {plate}")
+
+    if "entry" in gate_type:
+        allow = _handle_entry(db, plate, timestamp, image_path)
+    else:
+        allow = _handle_exit(db, plate, timestamp, image_path)
+
+    action = "open" if allow else "close"
+    return TriggerAck(status="allow" if allow else "deny", action=action, message=plate)
 
 
 # ── Business logic (sync — called from async background task) ─────────────────

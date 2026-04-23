@@ -1,18 +1,14 @@
 /*
- * Smart Parking System — ENTRY GATE Firmware v5.0
- * Architecture : Server-as-Master / ESP32-as-Slave
+ * Smart Parking System — ENTRY GATE Firmware v6.0
+ * Architecture : Push-based (ESP32 pushes image to server)
  * Hardware     : ESP32-CAM (AI-Thinker) + IR Sensor + SG90 Servo
  *
- * Changes from v4:
- *   - Registration endpoint moved to POST /api/devices/register
- *   - Registration payload uses "current_ip" and "device_type" fields
- *   - Added periodic heartbeat: POST /api/devices/heartbeat every 20 s
- *   - Backend now tracks device IP in DB — zero static IP configuration needed
- *
- * ESP32 exposes an HTTP server (port 80) with three slave endpoints:
- *   GET  /capture  — returns buffered JPEG (captured at IR trigger time)
- *   POST /gate     — {"action":"open"|"close"} — controls servo
- *   GET  /status   — device health JSON
+ * Changes from v5:
+ *   - sendTrigger() now sends JPEG inline as multipart/form-data POST
+ *   - Server returns {"action":"open"|"close"} synchronously — no callback needed
+ *   - ESP32 controls gate locally based on response — eliminates NAT issues
+ *   - HTTP_TIMEOUT_TRIGGER_MS raised to 20 s to allow server OCR time
+ *   - /capture and /gate slave endpoints kept for admin/debug use only
  *
  * Boot sequence:
  *   1. Connect WiFi
@@ -21,8 +17,9 @@
  *
  * On IR trigger:
  *   1. Capture frame to PSRAM buffer
- *   2. POST /api/iot/trigger (lightweight, no image — server responds 202)
- *   3. Server calls back /capture, runs OCR, then calls /gate
+ *   2. POST /api/iot/trigger  multipart: device_id + image
+ *   3. Parse response JSON → {"action":"open"|"close"}
+ *   4. Control servo locally
  *
  * Libraries (Arduino Library Manager):
  *   - ArduinoJson by Benoit Blanchon v6.x
@@ -45,7 +42,7 @@
 // Device identity — must be unique across all devices on this server
 #define DEVICE_ID    "entry"
 #define DEVICE_TYPE  "entry_cam"
-#define FW_VERSION   "5.0"
+#define FW_VERSION   "6.0"
 
 // ── Pin Definitions ───────────────────────────────────────────────────────────
 #define IR_SENSOR_PIN   14
@@ -85,7 +82,7 @@
 #define ZONE_CLEAR_MS   1500
 
 // ── Network timeouts ──────────────────────────────────────────────────────────
-#define HTTP_TIMEOUT_TRIGGER_MS   3000
+#define HTTP_TIMEOUT_TRIGGER_MS  20000
 #define HTTP_TIMEOUT_REGISTER_MS  5000
 #define HTTP_TIMEOUT_HEARTBEAT_MS 3000
 #define WEBSERVER_PORT              80
@@ -134,7 +131,7 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
-  Serial.println("\n=== ENTRY GATE v5.0 — Slave Mode ===");
+  Serial.println("\n=== ENTRY GATE v6.0 — Push Mode ===");
 
   pinMode(LED_FLASH_PIN, OUTPUT);
   digitalWrite(LED_FLASH_PIN, LOW);
@@ -166,7 +163,7 @@ void setup() {
 // =============================================================================
 
 void loop() {
-  // Service slave HTTP endpoints first (server is master — it calls us)
+  // Service HTTP endpoints (admin /gate, /capture, /status)
   server.handleClient();
 
   // Auto-close gate after timeout
@@ -192,7 +189,7 @@ void loop() {
     Serial.println("[IR] Vehicle detected — capturing");
 
     if (captureToBuffer()) {
-      Serial.printf("[CAM] Frame buffered: %u bytes — notifying server\n", g_frame_len);
+      Serial.printf("[CAM] Frame buffered: %u bytes — pushing to server\n", g_frame_len);
       sendTrigger();
     } else {
       Serial.println("[CAM] Capture failed — keeping gate closed");
@@ -352,36 +349,74 @@ bool captureToBuffer() {
 
 
 // =============================================================================
-// SEND TRIGGER — lightweight notification to master (no image)
-// Short timeout: server MUST respond 202 quickly so ESP32 can return to
-// loop() and serve the master's /capture callback via handleClient().
+// SEND TRIGGER — pushes JPEG to server, reads gate decision from response.
+// Multipart POST: device_id (form field) + image (JPEG file).
+// Server returns {"action":"open"|"close"} after running OCR + business logic.
+// Timeout is 20 s to allow server-side OCR (external API call) to complete.
 // =============================================================================
 
 void sendTrigger() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[TRIGGER] WiFi not connected — skipping");
+  if (WiFi.status() != WL_CONNECTED || !g_frame_ready || g_frame_len == 0) {
+    Serial.println("[TRIGGER] Cannot send — WiFi or frame not ready");
     return;
   }
 
-  StaticJsonDocument<128> doc;
-  doc["device_id"] = DEVICE_ID;
-  doc["ip"]        = WiFi.localIP().toString();  // freshness hint
-  String body;
-  serializeJson(doc, body);
+  const char* boundary = "ESP32CAMBound";
+
+  // Build multipart header and footer strings
+  String hdr;
+  hdr += "--"; hdr += boundary; hdr += "\r\n";
+  hdr += "Content-Disposition: form-data; name=\"device_id\"\r\n\r\n";
+  hdr += DEVICE_ID;
+  hdr += "\r\n--"; hdr += boundary; hdr += "\r\n";
+  hdr += "Content-Disposition: form-data; name=\"image\"; filename=\"capture.jpg\"\r\n";
+  hdr += "Content-Type: image/jpeg\r\n\r\n";
+
+  String ftr;
+  ftr += "\r\n--"; ftr += boundary; ftr += "--\r\n";
+
+  size_t totalLen = hdr.length() + g_frame_len + ftr.length();
+
+  uint8_t* body = (uint8_t*)ps_malloc(totalLen);
+  if (!body) body = (uint8_t*)malloc(totalLen);
+  if (!body) {
+    Serial.println("[TRIGGER] Body alloc failed — not enough RAM");
+    return;
+  }
+
+  memcpy(body,                          hdr.c_str(), hdr.length());
+  memcpy(body + hdr.length(),           g_frame_buf, g_frame_len);
+  memcpy(body + hdr.length() + g_frame_len, ftr.c_str(), ftr.length());
 
   HTTPClient http;
   http.begin(SERVER_BASE_URL "/api/iot/trigger");
-  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Content-Type", String("multipart/form-data; boundary=") + boundary);
   http.setTimeout(HTTP_TIMEOUT_TRIGGER_MS);
 
-  int code = http.POST(body);
-  if (code == 200 || code == 202) {
-    Serial.printf("[TRIGGER] Acknowledged (HTTP %d) — master is orchestrating\n", code);
-  } else if (code > 0) {
-    Serial.printf("[TRIGGER] Unexpected HTTP %d\n", code);
+  int code = http.POST(body, totalLen);
+  free(body);
+
+  if (code == 200) {
+    String resp = http.getString();
+    Serial.printf("[TRIGGER] Response: %s\n", resp.c_str());
+
+    StaticJsonDocument<128> doc;
+    DeserializationError err = deserializeJson(doc, resp);
+    if (!err) {
+      const char* action = doc["action"] | "close";
+      bool open = (strcmp(action, "open") == 0);
+      Serial.printf("[TRIGGER] Gate decision: %s\n", action);
+      controlGate(open);
+      if (open) g_frame_ready = false;
+    } else {
+      Serial.println("[TRIGGER] Bad JSON in response — closing gate");
+      controlGate(false);
+    }
   } else {
-    Serial.printf("[TRIGGER] Connection error: %s\n", http.errorToString(code).c_str());
+    Serial.printf("[TRIGGER] HTTP %d — closing gate\n", code > 0 ? code : -1);
+    controlGate(false);
   }
+
   http.end();
 }
 
