@@ -11,15 +11,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     OPENROUTER_API_KEY: str = ""
 
-    # Master→Slave: server calls these IPs to fetch images and command gates
-    ENTRY_CAM_IP: str = "192.168.1.100"
-    ENTRY_CAM_PORT: int = 80
-    EXIT_CAM_IP: str = "192.168.1.101"
-    EXIT_CAM_PORT: int = 80
-
-    # Legacy URL fields kept so existing .env files don't break
-    ENTRY_CAM_URL: str = ""
-    EXIT_CAM_URL: str = ""
+    # ESP32 device IPs are NOT configured here.
+    # Devices register themselves via POST /api/devices/register on every boot.
+    # The backend resolves the current IP from the `devices` table at runtime.
 
     CAPTURED_IMAGES_DIR: str = "captured_images"
     ENVIRONMENT: str = "development"

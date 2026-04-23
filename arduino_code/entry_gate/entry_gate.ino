@@ -1,25 +1,32 @@
 /*
- * Smart Parking System — ENTRY GATE Firmware v4.0
+ * Smart Parking System — ENTRY GATE Firmware v5.0
  * Architecture : Server-as-Master / ESP32-as-Slave
  * Hardware     : ESP32-CAM (AI-Thinker) + IR Sensor + SG90 Servo
  *
- * Role change from v3:
- *   v3 (wrong): ESP32 captures + POSTs image → server decides → ESP32 acts
- *   v4 (correct): ESP32 signals trigger → server fetches image → server decides → server commands gate
+ * Changes from v4:
+ *   - Registration endpoint moved to POST /api/devices/register
+ *   - Registration payload uses "current_ip" and "device_type" fields
+ *   - Added periodic heartbeat: POST /api/devices/heartbeat every 20 s
+ *   - Backend now tracks device IP in DB — zero static IP configuration needed
  *
- * ESP32 exposes an HTTP server (port 80) with three endpoints:
+ * ESP32 exposes an HTTP server (port 80) with three slave endpoints:
  *   GET  /capture  — returns buffered JPEG (captured at IR trigger time)
  *   POST /gate     — {"action":"open"|"close"} — controls servo
  *   GET  /status   — device health JSON
  *
- * On boot: registers device IP with server via POST /api/iot/register
- * On IR  : captures image to PSRAM buffer, then fires lightweight trigger
- *          POST /api/iot/trigger {"device_id":"entry","ip":"<self IP>"}
- *          Server responds 202, then calls back /capture and /gate asynchronously.
+ * Boot sequence:
+ *   1. Connect WiFi
+ *   2. POST /api/devices/register  (upserts current DHCP IP in server DB)
+ *   3. Loop: service HTTP, send heartbeat every 20 s, watch IR sensor
+ *
+ * On IR trigger:
+ *   1. Capture frame to PSRAM buffer
+ *   2. POST /api/iot/trigger (lightweight, no image — server responds 202)
+ *   3. Server calls back /capture, runs OCR, then calls /gate
  *
  * Libraries (Arduino Library Manager):
- *   • ArduinoJson by Benoit Blanchon v6.x
- *   • ESP32 board package by Espressif
+ *   - ArduinoJson by Benoit Blanchon v6.x
+ *   - ESP32 board package by Espressif
  */
 
 #include "esp_camera.h"
@@ -35,9 +42,10 @@
 #define WIFI_PASSWORD   "12345678@"
 #define SERVER_BASE_URL "http://192.168.1.16:8000"
 
-// Device identity — do NOT change on the exit-gate unit
-#define DEVICE_ID   "entry"
-#define GATE_TYPE   "entry"
+// Device identity — must be unique across all devices on this server
+#define DEVICE_ID    "entry"
+#define DEVICE_TYPE  "entry_cam"
+#define FW_VERSION   "5.0"
 
 // ── Pin Definitions ───────────────────────────────────────────────────────────
 #define IR_SENSOR_PIN   14
@@ -76,10 +84,14 @@
 #define IR_DEBOUNCE_MS    60
 #define ZONE_CLEAR_MS   1500
 
-// ── Network ───────────────────────────────────────────────────────────────────
-#define HTTP_TIMEOUT_TRIGGER_MS  3000   // Short: server must respond 202 fast
-#define HTTP_TIMEOUT_REGISTER_MS 5000
-#define WEBSERVER_PORT             80
+// ── Network timeouts ──────────────────────────────────────────────────────────
+#define HTTP_TIMEOUT_TRIGGER_MS   3000
+#define HTTP_TIMEOUT_REGISTER_MS  5000
+#define HTTP_TIMEOUT_HEARTBEAT_MS 3000
+#define WEBSERVER_PORT              80
+
+// ── Heartbeat ─────────────────────────────────────────────────────────────────
+#define HEARTBEAT_INTERVAL_MS  20000   // 20 s — well within 60 s offline threshold
 
 // ── Frame buffer (PSRAM) ──────────────────────────────────────────────────────
 static uint8_t* g_frame_buf  = nullptr;
@@ -94,6 +106,9 @@ static unsigned long gateOpenedMs = 0;
 static bool          vehiclePresent = false;
 static unsigned long lastDetectMs   = 0;
 
+// ── Heartbeat state ───────────────────────────────────────────────────────────
+static unsigned long lastHeartbeatMs = 0;
+
 // ── HTTP server (slave endpoints) ────────────────────────────────────────────
 WebServer server(WEBSERVER_PORT);
 
@@ -103,6 +118,7 @@ bool  initCamera();
 bool  captureToBuffer();
 void  sendTrigger();
 void  registerWithServer();
+void  sendHeartbeat();
 void  controlGate(bool open);
 bool  readIR();
 void  handleCapture();
@@ -118,7 +134,7 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
-  Serial.println("\n=== ENTRY GATE v4.0 — Slave Mode ===");
+  Serial.println("\n=== ENTRY GATE v5.0 — Slave Mode ===");
 
   pinMode(LED_FLASH_PIN, OUTPUT);
   digitalWrite(LED_FLASH_PIN, LOW);
@@ -138,7 +154,7 @@ void setup() {
   server.begin();
   Serial.printf("[HTTP] Slave server listening on port %d\n", WEBSERVER_PORT);
 
-  // ── Register with master ──────────────────────────────────────────────────
+  // ── Register with master — informs server of current DHCP IP ─────────────
   registerWithServer();
 
   Serial.println("=== Ready — monitoring IR, serving HTTP ===");
@@ -159,6 +175,12 @@ void loop() {
     Serial.println("[GATE] Auto-closed");
   }
 
+  // Periodic heartbeat — keeps device marked online in server DB
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+    sendHeartbeat();
+    lastHeartbeatMs = millis();
+  }
+
   bool detected = readIR();
 
   // Rising edge: vehicle arrives
@@ -171,9 +193,7 @@ void loop() {
 
     if (captureToBuffer()) {
       Serial.printf("[CAM] Frame buffered: %u bytes — notifying server\n", g_frame_len);
-      // Notify master (fire short POST, get 202, return to loop fast)
       sendTrigger();
-      // Master will call /capture and /gate via server.handleClient()
     } else {
       Serial.println("[CAM] Capture failed — keeping gate closed");
     }
@@ -193,7 +213,7 @@ void loop() {
 
 // =============================================================================
 // SLAVE ENDPOINT: GET /capture
-// Master calls this to pull the JPEG that was buffered at IR-trigger time.
+// Master calls this to pull the JPEG buffered at IR-trigger time.
 // =============================================================================
 
 void handleCapture() {
@@ -203,7 +223,6 @@ void handleCapture() {
     return;
   }
 
-  // Send binary JPEG via raw WiFiClient to avoid String null-byte truncation
   WiFiClient client = server.client();
   client.print("HTTP/1.1 200 OK\r\n"
                "Content-Type: image/jpeg\r\n"
@@ -223,7 +242,6 @@ void handleCapture() {
   }
 
   Serial.printf("[HTTP] /capture → %u bytes served\n", g_frame_len);
-  // Do NOT clear g_frame_ready here; master may retry /capture on error
 }
 
 
@@ -252,9 +270,8 @@ void handleGate() {
   bool open = (strcmp(action, "open") == 0);
   controlGate(open);
 
-  // After gate is opened, clear frame buffer — event is complete
   if (open) {
-    g_frame_ready = false;
+    g_frame_ready = false;   // event complete — clear buffer
   }
 
   server.send(200, "application/json",
@@ -271,7 +288,8 @@ void handleStatus() {
   String ip = WiFi.localIP().toString();
   String json =
     "{\"device_id\":\"" DEVICE_ID "\","
-    "\"gate_type\":\"" GATE_TYPE "\","
+    "\"device_type\":\"" DEVICE_TYPE "\","
+    "\"firmware\":\"" FW_VERSION "\","
     "\"ip\":\"" + ip + "\","
     "\"gate_open\":" + (gateOpen ? "true" : "false") + ","
     "\"frame_ready\":" + (g_frame_ready ? "true" : "false") + ","
@@ -308,7 +326,6 @@ bool captureToBuffer() {
 
   Serial.printf("[CAM] Captured %dx%d — %d bytes\n", fb->width, fb->height, fb->len);
 
-  // Allocate PSRAM (4 MB on AI-Thinker), fall back to heap
   if (g_frame_buf) {
     free(g_frame_buf);
     g_frame_buf = nullptr;
@@ -336,8 +353,8 @@ bool captureToBuffer() {
 
 // =============================================================================
 // SEND TRIGGER — lightweight notification to master (no image)
-// Short timeout (3 s): server MUST respond 202 quickly so ESP32 can return
-// to loop() and serve the master's /capture callback.
+// Short timeout: server MUST respond 202 quickly so ESP32 can return to
+// loop() and serve the master's /capture callback via handleClient().
 // =============================================================================
 
 void sendTrigger() {
@@ -348,7 +365,7 @@ void sendTrigger() {
 
   StaticJsonDocument<128> doc;
   doc["device_id"] = DEVICE_ID;
-  doc["ip"]        = WiFi.localIP().toString();
+  doc["ip"]        = WiFi.localIP().toString();  // freshness hint
   String body;
   serializeJson(doc, body);
 
@@ -366,39 +383,70 @@ void sendTrigger() {
     Serial.printf("[TRIGGER] Connection error: %s\n", http.errorToString(code).c_str());
   }
   http.end();
-  // Return immediately — master will call back via /capture and /gate
 }
 
 
 // =============================================================================
 // REGISTER WITH MASTER SERVER
-// Called on boot so the server knows this device's current IP.
+// Called on boot. Upserts device record in server DB with current DHCP IP.
+// No static IP required anywhere — server always uses the DB value.
 // =============================================================================
 
 void registerWithServer() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  StaticJsonDocument<128> doc;
-  doc["device_id"] = DEVICE_ID;
-  doc["gate_type"] = GATE_TYPE;
-  doc["ip"]        = WiFi.localIP().toString();
-  doc["port"]      = WEBSERVER_PORT;
+  StaticJsonDocument<192> doc;
+  doc["device_id"]        = DEVICE_ID;
+  doc["current_ip"]       = WiFi.localIP().toString();
+  doc["device_type"]      = DEVICE_TYPE;
+  doc["port"]             = WEBSERVER_PORT;
+  doc["firmware_version"] = FW_VERSION;
   String body;
   serializeJson(doc, body);
 
   HTTPClient http;
-  http.begin(SERVER_BASE_URL "/api/iot/register");
+  http.begin(SERVER_BASE_URL "/api/devices/register");
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(HTTP_TIMEOUT_REGISTER_MS);
 
   int code = http.POST(body);
   if (code > 0) {
     Serial.printf("[REGISTER] Registered with server (HTTP %d)\n", code);
-    Serial.printf("[REGISTER] IP: %s, device_id: %s\n",
-                  WiFi.localIP().toString().c_str(), DEVICE_ID);
+    Serial.printf("[REGISTER] device_id=%s  ip=%s  type=%s\n",
+                  DEVICE_ID, WiFi.localIP().toString().c_str(), DEVICE_TYPE);
   } else {
-    Serial.printf("[REGISTER] Failed: %s — server may register via trigger\n",
-                  http.errorToString(code).c_str());
+    Serial.printf("[REGISTER] Failed: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+
+// =============================================================================
+// HEARTBEAT — periodic keepalive so server knows device is still online.
+// If the server receives no heartbeat for 60 s it marks this device offline
+// and gate-control commands will fail with 503 until device re-registers.
+// =============================================================================
+
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  StaticJsonDocument<64> doc;
+  doc["device_id"] = DEVICE_ID;
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  http.begin(SERVER_BASE_URL "/api/devices/heartbeat");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(HTTP_TIMEOUT_HEARTBEAT_MS);
+
+  int code = http.POST(body);
+  if (code == 200) {
+    Serial.println("[HB] OK");
+  } else if (code > 0) {
+    Serial.printf("[HB] Unexpected HTTP %d\n", code);
+  } else {
+    Serial.printf("[HB] Failed: %s\n", http.errorToString(code).c_str());
   }
   http.end();
 }

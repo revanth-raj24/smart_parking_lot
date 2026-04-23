@@ -4,5 +4,6 @@ from app.models.parking_slot import ParkingSlot
 from app.models.parking_session import ParkingSession
 from app.models.wallet import Wallet
 from app.models.transaction import Transaction
+from app.models.device import Device
 
-__all__ = ["User", "Vehicle", "ParkingSlot", "ParkingSession", "Wallet", "Transaction"]
+__all__ = ["User", "Vehicle", "ParkingSlot", "ParkingSession", "Wallet", "Transaction", "Device"]

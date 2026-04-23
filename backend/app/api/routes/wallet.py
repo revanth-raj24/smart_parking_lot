@@ -8,6 +8,7 @@ from app.models.wallet import Wallet
 from app.models.transaction import Transaction, TransactionType, TransactionStatus
 from app.schemas.wallet import WalletOut, AddFundsRequest, AddFundsResponse, TransactionOut
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 
 router = APIRouter()
 
@@ -34,7 +35,8 @@ def add_funds(
     current_user: User = Depends(get_current_user),
 ):
     wallet = _get_wallet(current_user.id, db)
-    wallet.balance = round(wallet.balance + payload.amount, 2)
+    wallet.balance = (wallet.balance + Decimal(str(payload.amount))).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP)
     wallet.updated_at = datetime.now(timezone.utc)
 
     txn = Transaction(

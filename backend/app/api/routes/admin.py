@@ -8,8 +8,8 @@ import httpx
 
 from app.db.database import get_db
 from app.core.deps import get_current_admin
-from app.core.config import settings
 from app.models.user import User
+from app.services.device_service import get_device_ip
 from app.models.vehicle import Vehicle
 from app.models.wallet import Wallet
 from app.models.parking_slot import ParkingSlot, SlotStatus
@@ -382,22 +382,40 @@ def all_captures(
 @router.post("/gate-control")
 async def gate_control(
     payload: GateCommand,
+    db: Session = Depends(get_db),
     _admin: User = Depends(get_current_admin),
 ):
     if payload.gate not in ("entry", "exit"):
         raise HTTPException(status_code=400, detail="gate must be 'entry' or 'exit'")
     if payload.action not in ("open", "close"):
         raise HTTPException(status_code=400, detail="action must be 'open' or 'close'")
-    cam_url = settings.ENTRY_CAM_URL if payload.gate == "entry" else settings.EXIT_CAM_URL
-    esp32_base = cam_url.rsplit("/", 1)[0]
-    target = f"{esp32_base}/gate/{payload.action}"
+
+    device_type = f"{payload.gate}_cam"   # "entry_cam" | "exit_cam"
+    try:
+        ip, port = get_device_ip(db, device_type)
+    except LookupError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    target = f"http://{ip}:{port}/gate"
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(target)
-            return {"status": "sent", "gate": payload.gate, "action": payload.action, "esp32_response": resp.status_code}
+            resp = await client.post(target, json={"action": payload.action})
+            return {
+                "status": "sent",
+                "gate": payload.gate,
+                "action": payload.action,
+                "device_ip": ip,
+                "esp32_response": resp.status_code,
+            }
     except httpx.RequestError as exc:
         logger.warning(f"[ADMIN] Gate control failed: {exc}")
-        return {"status": "unreachable", "gate": payload.gate, "action": payload.action, "error": str(exc)}
+        return {
+            "status": "unreachable",
+            "gate": payload.gate,
+            "action": payload.action,
+            "device_ip": ip,
+            "error": str(exc),
+        }
 
 
 # ── Transactions ──────────────────────────────────────────────────────────────
