@@ -60,18 +60,18 @@ def _is_valid_plate(text: str) -> bool:
 
 
 def flip_image_horizontal(image_bytes: bytes) -> bytes:
-    """Return a 180°-rotated (camera-corrected) JPEG from raw bytes."""
+    """Return a horizontally mirrored JPEG — corrects ESP32-CAM mirror output."""
     if not HAS_PIL:
-        logger.warning("[OCR] PIL not available — cannot rotate image")
+        logger.warning("[OCR] PIL not available — cannot mirror image")
         return image_bytes
     try:
         img = Image.open(BytesIO(image_bytes))
-        img = img.rotate(180)
+        img = img.rotate(180).transpose(Image.FLIP_LEFT_RIGHT)
         buffer = BytesIO()
         img.save(buffer, format="JPEG", quality=95)
         return buffer.getvalue()
     except Exception as exc:
-        logger.error(f"[OCR] Image rotation failed: {exc}")
+        logger.error(f"[OCR] Image mirror failed: {exc}")
         return image_bytes
 
 

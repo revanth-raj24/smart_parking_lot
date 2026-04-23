@@ -4,7 +4,8 @@ module.exports = {
       name: 'smartpark-api',
       cwd: '/var/www/smart-parking/backend',
       script: '/var/www/smart-parking/backend/venv/bin/uvicorn',
-      args: 'main:app --host 127.0.0.1 --port 8000 --workers 2 --loop uvloop',
+      // workers=1: required for SQLite (no concurrent writes) and in-memory IoT device registry
+      args: 'main:app --host 127.0.0.1 --port 8000 --workers 1 --loop uvloop',
       interpreter: 'none',
       autorestart: true,
       restart_delay: 3000,

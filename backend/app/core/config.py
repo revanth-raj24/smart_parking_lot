@@ -10,8 +10,17 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     OPENROUTER_API_KEY: str = ""
-    ENTRY_CAM_URL: str = "http://192.168.1.100/capture"
-    EXIT_CAM_URL: str = "http://192.168.1.101/capture"
+
+    # Master→Slave: server calls these IPs to fetch images and command gates
+    ENTRY_CAM_IP: str = "192.168.1.100"
+    ENTRY_CAM_PORT: int = 80
+    EXIT_CAM_IP: str = "192.168.1.101"
+    EXIT_CAM_PORT: int = 80
+
+    # Legacy URL fields kept so existing .env files don't break
+    ENTRY_CAM_URL: str = ""
+    EXIT_CAM_URL: str = ""
+
     CAPTURED_IMAGES_DIR: str = "captured_images"
     ENVIRONMENT: str = "development"
     USER_APP_ORIGIN: str = "http://localhost:5173"

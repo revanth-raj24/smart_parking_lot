@@ -9,7 +9,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
-from app.api.routes import auth, parking, wallet, admin, esp32
+from app.api.routes import auth, parking, wallet, admin, esp32, iot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,14 +75,19 @@ _OPENAPI_TAGS = [
     {
         "name": "iot",
         "description": (
-            "ESP32 camera endpoints for entry and exit gate events. "
-            "Accepts a JPEG image, runs OCR to read the license plate, "
-            "and returns `ALLOW` / `DENY`. No user auth required."
+            "**Master-Slave IoT (v4+)** — Server is master, ESP32 is slave. "
+            "`POST /register` — ESP32 registers its IP on boot. "
+            "`POST /trigger` — ESP32 notifies vehicle detected (no image); server fetches image, "
+            "runs OCR, then commands the gate via `POST http://ESP32_IP/gate`. "
+            "No user auth required."
         ),
     },
     {
-        "name": "esp32-legacy",
-        "description": "Legacy `/api/esp32` prefix — identical to `/api/iot`. Kept for backward compatibility with v1 firmware.",
+        "name": "iot-legacy",
+        "description": (
+            "**Legacy push-mode (v3 firmware)** — ESP32 posts JPEG directly to server. "
+            "Kept for hardware that has not been reflashed to v4 slave firmware."
+        ),
     },
     {
         "name": "health",
@@ -157,10 +162,11 @@ app.include_router(parking.router, prefix="/api/parking", tags=["parking"])
 app.include_router(wallet.router,  prefix="/api/wallet",  tags=["wallet"])
 app.include_router(admin.router,   prefix="/api/admin",   tags=["admin"])
 
-# IoT routes — new canonical prefix for firmware v2+
-app.include_router(esp32.router, prefix="/api/iot",   tags=["iot"])
-# Legacy prefix preserved so existing flashed hardware keeps working
-app.include_router(esp32.router, prefix="/api/esp32", tags=["esp32-legacy"])
+# IoT master-slave routes (v4+ firmware — server as master, ESP32 as slave)
+app.include_router(iot.router,   prefix="/api/iot",   tags=["iot"])
+
+# Legacy push-mode routes — v3 firmware that POSTs images directly
+app.include_router(esp32.router, prefix="/api/esp32", tags=["iot-legacy"])
 
 
 @app.get("/api/health", tags=["health"], summary="Health check")

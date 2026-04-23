@@ -555,35 +555,478 @@ function SessionsTab() {
   )
 }
 
-// ── Transactions Tab ──────────────────────────────────────────────────────────
-function TransactionsTab() {
-  const [txns, setTxns] = useState([])
-  useEffect(() => { adminGetTransactions({ limit: 200 }).then(r => setTxns(r.data)) }, [])
+// ── Transactions – shared helpers ─────────────────────────────────────────────
+const PAYMENT_BADGE = {
+  success: 'bg-green-900/50 text-green-400 border border-green-800/60',
+  failed:  'bg-red-900/50  text-red-400  border border-red-800/60',
+  pending: 'bg-yellow-900/50 text-yellow-400 border border-yellow-800/60',
+}
+const SESSION_BADGE = {
+  active:    'bg-yellow-900/50 text-yellow-400',
+  completed: 'bg-blue-900/50  text-blue-400',
+  denied:    'bg-red-900/50   text-red-400',
+}
+
+function fmtDateTime(dt) {
+  if (!dt) return '—'
+  return new Date(dt).toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+function fmtDateShort(dt) {
+  if (!dt) return '—'
+  return new Date(dt).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false })
+}
+function fmtDur(mins) {
+  if (mins == null) return '—'
+  const h = Math.floor(mins / 60)
+  const m = Math.round(mins % 60)
+  return h > 0 ? `${h}h ${m}m` : `${m}m`
+}
+
+// ── Info Row helper ───────────────────────────────────────────────────────────
+function InfoRow({ label, value, mono = false, accent = false }) {
   return (
-    <div className="card overflow-x-auto">
+    <div>
+      <p className="text-[11px] text-gray-500 mb-0.5">{label}</p>
+      <p className={`text-sm ${mono ? 'font-mono' : ''} ${accent ? 'text-green-400 font-semibold' : 'text-gray-200'} break-all`}>{value ?? '—'}</p>
+    </div>
+  )
+}
+
+// ── Transaction Detail Modal ──────────────────────────────────────────────────
+function TransactionModal({ txn, onClose }) {
+  if (!txn) return null
+
+  const isDebit = txn.transaction_type === 'debit'
+
+  const SectionHeader = ({ children }) => (
+    <div className="flex items-center gap-2 mb-3">
+      <div className="w-1 h-4 bg-green-600 rounded-full" />
+      <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest">{children}</h3>
+    </div>
+  )
+
+  return (
+    <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4" onClick={onClose}>
+      <div
+        className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-2xl max-h-[92vh] overflow-y-auto shadow-2xl"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="flex items-start justify-between p-6 border-b border-gray-800">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className={`text-xs font-bold px-2 py-0.5 rounded-full uppercase ${PAYMENT_BADGE[txn.payment_status] || 'bg-gray-800 text-gray-400'}`}>
+                {txn.payment_status}
+              </span>
+              <span className={`text-xs font-bold px-2 py-0.5 rounded-full uppercase ${isDebit ? 'bg-red-900/40 text-red-400' : 'bg-green-900/40 text-green-400'}`}>
+                {txn.transaction_type}
+              </span>
+            </div>
+            <h2 className="text-xl font-bold text-white">
+              {isDebit ? '−' : '+'}₹{txn.amount.toFixed(2)}
+            </h2>
+            <p className="text-xs text-gray-500 font-mono mt-0.5">{txn.reference_id || `TXN #${txn.id}`}</p>
+          </div>
+          <button onClick={onClose} className="p-2 text-gray-500 hover:text-white hover:bg-gray-800 rounded-lg transition-colors ml-4 flex-shrink-0">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-6">
+          {/* Summary */}
+          <div>
+            <SectionHeader>Summary</SectionHeader>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <InfoRow label="Transaction ID" value={`#${txn.id}`} mono />
+              <InfoRow label="Reference" value={txn.reference_id} mono />
+              <InfoRow label="Date" value={fmtDateTime(txn.created_at)} />
+              <InfoRow label="Vehicle" value={txn.vehicle_number} mono accent />
+              <InfoRow label="Parking Slot" value={txn.parking_slot} mono />
+              {txn.session_status && (
+                <div>
+                  <p className="text-[11px] text-gray-500 mb-0.5">Session Status</p>
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full uppercase ${SESSION_BADGE[txn.session_status] || 'bg-gray-800 text-gray-400'}`}>
+                    {txn.session_status}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Timing */}
+          {(txn.entry_time || txn.exit_time || txn.duration_minutes != null) && (
+            <div>
+              <SectionHeader>Timing</SectionHeader>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+                <InfoRow label="Entry Time"     value={fmtDateTime(txn.entry_time)} />
+                <InfoRow label="Exit Time"      value={fmtDateTime(txn.exit_time)} />
+                <InfoRow label="Total Duration" value={fmtDur(txn.duration_minutes)} />
+              </div>
+            </div>
+          )}
+
+          {/* Payment */}
+          <div>
+            <SectionHeader>Payment</SectionHeader>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <div>
+                <p className="text-[11px] text-gray-500 mb-0.5">Amount</p>
+                <p className={`text-2xl font-bold ${isDebit ? 'text-red-400' : 'text-green-400'}`}>
+                  {isDebit ? '−' : '+'}₹{txn.amount.toFixed(2)}
+                </p>
+              </div>
+              <InfoRow label="Type"        value={txn.transaction_type?.toUpperCase()} />
+              <div>
+                <p className="text-[11px] text-gray-500 mb-0.5">Payment Status</p>
+                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full uppercase ${PAYMENT_BADGE[txn.payment_status] || 'bg-gray-800 text-gray-400'}`}>
+                  {txn.payment_status}
+                </span>
+              </div>
+              {txn.description && (
+                <div className="col-span-2 sm:col-span-3">
+                  <InfoRow label="Description" value={txn.description} />
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* User */}
+          <div>
+            <SectionHeader>User Info</SectionHeader>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+              <InfoRow label="User ID" value={`#${txn.user_id}`} mono />
+              <InfoRow label="Name"    value={txn.user_name} />
+              <InfoRow label="Email"   value={txn.user_email} />
+            </div>
+          </div>
+
+          {/* Images */}
+          {(txn.entry_image || txn.exit_image) && (
+            <div>
+              <SectionHeader>Captured Images</SectionHeader>
+              <div className="grid grid-cols-2 gap-4">
+                {['entry', 'exit'].map(side => {
+                  const imgFile = side === 'entry' ? txn.entry_image : txn.exit_image
+                  return (
+                    <div key={side}>
+                      <p className="text-[11px] text-gray-500 mb-1.5 capitalize">{side} Image</p>
+                      {imgFile ? (
+                        <a href={`/images/${imgFile}`} target="_blank" rel="noreferrer" className="group block">
+                          <img
+                            src={`/images/${imgFile}`}
+                            alt={`${side} capture`}
+                            className="w-full h-40 object-cover rounded-xl border border-gray-700 group-hover:opacity-90 transition-opacity"
+                            onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
+                          />
+                          <div className="hidden h-40 bg-gray-800 rounded-xl border border-gray-700 items-center justify-center text-gray-600 text-xs">
+                            Failed to load
+                          </div>
+                          <p className="text-[10px] text-green-500 mt-1 flex items-center gap-0.5"><ExternalLink size={9} /> View full size</p>
+                        </a>
+                      ) : (
+                        <div className="h-40 bg-gray-900 rounded-xl border border-gray-800 flex flex-col items-center justify-center text-gray-700 gap-1">
+                          <Camera size={24} />
+                          <p className="text-xs">No {side} image</p>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Transaction Table ─────────────────────────────────────────────────────────
+function TransactionTable({ txns, onView }) {
+  if (txns.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-gray-600 gap-3">
+        <ArrowDownCircle size={40} />
+        <p className="text-sm font-medium">No transactions found</p>
+        <p className="text-xs">Try adjusting your filters</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
           <tr className="text-left text-gray-500 border-b border-gray-800">
-            {['ID', 'User', 'Amount', 'Type', 'Status', 'Description', 'Date'].map(h => <th key={h} className="pb-3 pr-4 font-medium">{h}</th>)}
+            {['Ref / ID', 'Vehicle', 'User', 'Entry → Exit', 'Duration', 'Slot', 'Amount', 'Payment', 'Status', ''].map((h, i) => (
+              <th key={i} className="pb-3 pr-3 font-medium text-xs whitespace-nowrap">{h}</th>
+            ))}
           </tr>
         </thead>
         <tbody>
-          {txns.map(t => (
-            <tr key={t.id} className="border-b border-gray-800/50 hover:bg-gray-800/20 text-xs">
-              <td className="py-2.5 pr-4 text-gray-500">{t.id}</td>
-              <td className="py-2.5 pr-4 text-gray-400">{t.user_id}</td>
-              <td className={`py-2.5 pr-4 font-semibold ${t.transaction_type === 'credit' ? 'text-green-400' : 'text-red-400'}`}>
-                {t.transaction_type === 'credit' ? '+' : '-'}₹{t.amount.toFixed(2)}
-              </td>
-              <td className="py-2.5 pr-4 capitalize text-gray-300">{t.transaction_type}</td>
-              <td className="py-2.5 pr-4"><span className={`px-1.5 py-0.5 rounded text-xs ${t.status === 'success' ? 'bg-green-900 text-green-400' : 'bg-red-900 text-red-400'}`}>{t.status}</span></td>
-              <td className="py-2.5 pr-4 text-gray-400 max-w-[200px] truncate">{t.description}</td>
-              <td className="py-2.5 pr-4 text-gray-500 whitespace-nowrap">{new Date(t.created_at).toLocaleString()}</td>
-            </tr>
-          ))}
+          {txns.map(t => {
+            const isDebit = t.transaction_type === 'debit'
+            return (
+              <tr key={t.id} className="border-b border-gray-800/40 hover:bg-gray-800/25 transition-colors text-xs group">
+                {/* Ref / ID */}
+                <td className="py-3 pr-3">
+                  <p className="font-mono text-gray-400">#{t.id}</p>
+                  {t.reference_id && (
+                    <p className="font-mono text-gray-600 text-[10px] truncate max-w-[88px]" title={t.reference_id}>
+                      {t.reference_id}
+                    </p>
+                  )}
+                </td>
+                {/* Vehicle */}
+                <td className="py-3 pr-3">
+                  {t.vehicle_number
+                    ? <span className="font-mono font-bold text-white bg-gray-800 px-2 py-0.5 rounded">{t.vehicle_number}</span>
+                    : <span className="text-gray-600">—</span>}
+                </td>
+                {/* User */}
+                <td className="py-3 pr-3">
+                  <p className="text-gray-300 truncate max-w-[96px]" title={t.user_name}>{t.user_name || '—'}</p>
+                  <p className="text-gray-600 text-[10px] truncate max-w-[96px]" title={t.user_email}>{t.user_email || ''}</p>
+                </td>
+                {/* Entry → Exit */}
+                <td className="py-3 pr-3 text-gray-400 whitespace-nowrap">
+                  <p>{fmtDateShort(t.entry_time)}</p>
+                  {t.exit_time && <p className="text-gray-600">{fmtDateShort(t.exit_time)}</p>}
+                  {!t.entry_time && <span className="text-gray-600">—</span>}
+                </td>
+                {/* Duration */}
+                <td className="py-3 pr-3 text-gray-400">{fmtDur(t.duration_minutes)}</td>
+                {/* Slot */}
+                <td className="py-3 pr-3">
+                  {t.parking_slot
+                    ? <span className="font-mono font-bold text-green-400 bg-green-900/20 px-2 py-0.5 rounded">{t.parking_slot}</span>
+                    : <span className="text-gray-600">—</span>}
+                </td>
+                {/* Amount */}
+                <td className={`py-3 pr-3 font-bold ${isDebit ? 'text-red-400' : 'text-green-400'}`}>
+                  {isDebit ? '−' : '+'}₹{t.amount.toFixed(2)}
+                </td>
+                {/* Payment Status */}
+                <td className="py-3 pr-3">
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase whitespace-nowrap ${PAYMENT_BADGE[t.payment_status] || 'bg-gray-800 text-gray-400'}`}>
+                    {t.payment_status}
+                  </span>
+                </td>
+                {/* Session Status */}
+                <td className="py-3 pr-3">
+                  {t.session_status
+                    ? <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${SESSION_BADGE[t.session_status] || 'bg-gray-800 text-gray-400'}`}>{t.session_status}</span>
+                    : <span className="text-gray-600 text-[10px]">—</span>}
+                </td>
+                {/* Actions */}
+                <td className="py-3">
+                  <button
+                    onClick={() => onView(t)}
+                    className="px-2.5 py-1 rounded-lg text-[10px] font-medium bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white transition-colors opacity-0 group-hover:opacity-100 flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <ExternalLink size={10} /> Details
+                  </button>
+                </td>
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
+  )
+}
+
+// ── Skeleton loader ───────────────────────────────────────────────────────────
+function TableSkeleton({ rows = 8 }) {
+  return (
+    <div className="space-y-2.5 p-1">
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="h-9 bg-gray-800/60 rounded-lg animate-pulse" style={{ opacity: 1 - i * 0.08 }} />
+      ))}
+    </div>
+  )
+}
+
+// ── Transactions Tab ──────────────────────────────────────────────────────────
+const TXN_STATUS_OPTS = [
+  { key: '',         label: 'All Status' },
+  { key: 'success',  label: 'Success' },
+  { key: 'failed',   label: 'Failed' },
+  { key: 'pending',  label: 'Pending' },
+]
+const TXN_TYPE_OPTS = [
+  { key: '',       label: 'All Types' },
+  { key: 'debit',  label: 'Debit' },
+  { key: 'credit', label: 'Credit' },
+]
+const TXN_PAGE_LIMIT = 50
+
+function TransactionsTab() {
+  const [txns,    setTxns]    = useState([])
+  const [total,   setTotal]   = useState(0)
+  const [page,    setPage]    = useState(1)
+  const [loading, setLoading] = useState(true)
+  const [selected, setSelected] = useState(null)
+
+  // Filters
+  const [statusFilter,  setStatusFilter]  = useState('')
+  const [typeFilter,    setTypeFilter]    = useState('')
+  const [vehicleSearch, setVehicleSearch] = useState('')
+  const [dateFrom,      setDateFrom]      = useState('')
+  const [dateTo,        setDateTo]        = useState('')
+
+  const resetPage = (setter) => (val) => { setter(val); setPage(1) }
+
+  const fetchTxns = useCallback(() => {
+    setLoading(true)
+    const params = { page, limit: TXN_PAGE_LIMIT }
+    if (statusFilter)         params.status   = statusFilter
+    if (typeFilter)           params.txn_type = typeFilter
+    if (vehicleSearch.trim()) params.vehicle  = vehicleSearch.trim()
+    if (dateFrom)             params.date_from = dateFrom
+    if (dateTo)               params.date_to   = dateTo
+    adminGetTransactions(params)
+      .then(r => {
+        setTxns(r.data.transactions ?? [])
+        setTotal(r.data.total ?? 0)
+      })
+      .catch(() => toast.error('Failed to load transactions'))
+      .finally(() => setLoading(false))
+  }, [page, statusFilter, typeFilter, vehicleSearch, dateFrom, dateTo])
+
+  useEffect(() => { fetchTxns() }, [fetchTxns])
+
+  const totalPages  = Math.max(1, Math.ceil(total / TXN_PAGE_LIMIT))
+  const hasFilters  = statusFilter || typeFilter || vehicleSearch || dateFrom || dateTo
+
+  const clearFilters = () => {
+    resetPage(setStatusFilter)('')
+    resetPage(setTypeFilter)('')
+    resetPage(setVehicleSearch)('')
+    resetPage(setDateFrom)('')
+    resetPage(setDateTo)('')
+  }
+
+  // Page number range for pagination bar
+  const pageNumbers = (() => {
+    if (totalPages <= 7) return Array.from({ length: totalPages }, (_, i) => i + 1)
+    const pages = []
+    const lo = Math.max(2, Math.min(page - 2, totalPages - 5))
+    const hi = Math.min(totalPages - 1, lo + 4)
+    pages.push(1)
+    if (lo > 2) pages.push('…')
+    for (let p = lo; p <= hi; p++) pages.push(p)
+    if (hi < totalPages - 1) pages.push('…')
+    pages.push(totalPages)
+    return pages
+  })()
+
+  return (
+    <>
+      {selected && <TransactionModal txn={selected} onClose={() => setSelected(null)} />}
+
+      <div className="space-y-4">
+        {/* ── Filter bar ── */}
+        <div className="card space-y-3">
+          <div className="flex flex-wrap gap-2 items-center">
+            {/* Status pill filter */}
+            <div className="flex gap-1 bg-gray-900 p-1 rounded-lg border border-gray-800">
+              {TXN_STATUS_OPTS.map(f => (
+                <button key={f.key} onClick={() => resetPage(setStatusFilter)(f.key)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded transition-colors ${statusFilter === f.key ? 'bg-green-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Type pill filter */}
+            <div className="flex gap-1 bg-gray-900 p-1 rounded-lg border border-gray-800">
+              {TXN_TYPE_OPTS.map(f => (
+                <button key={f.key} onClick={() => resetPage(setTypeFilter)(f.key)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded transition-colors ${typeFilter === f.key ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex-1" />
+            <button onClick={fetchTxns} className="btn-ghost text-xs flex items-center gap-1">
+              <RefreshCw size={12} /> Refresh
+            </button>
+          </div>
+
+          {/* Search + date row */}
+          <div className="flex flex-col sm:flex-row gap-2">
+            <div className="relative flex-1 min-w-0">
+              <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500 pointer-events-none" />
+              <input
+                className="input pl-7 text-xs w-full"
+                placeholder="Search vehicle plate…"
+                value={vehicleSearch}
+                onChange={e => resetPage(setVehicleSearch)(e.target.value)}
+              />
+            </div>
+            <input type="date" className="input text-xs" title="From date" value={dateFrom} onChange={e => resetPage(setDateFrom)(e.target.value)} />
+            <input type="date" className="input text-xs" title="To date"   value={dateTo}   onChange={e => resetPage(setDateTo)(e.target.value)} />
+            {hasFilters && (
+              <button onClick={clearFilters} className="btn-ghost text-xs px-3 flex items-center gap-1 text-red-400 hover:text-red-300">
+                <X size={12} /> Clear
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* ── Count row ── */}
+        <div className="flex items-center justify-between text-xs text-gray-500 px-1">
+          <span>
+            {loading ? 'Loading…' : `${total.toLocaleString()} transaction${total !== 1 ? 's' : ''}`}
+          </span>
+          {!loading && totalPages > 1 && (
+            <span>Page {page} of {totalPages}</span>
+          )}
+        </div>
+
+        {/* ── Table card ── */}
+        <div className="card">
+          {loading ? <TableSkeleton rows={8} /> : <TransactionTable txns={txns} onView={setSelected} />}
+        </div>
+
+        {/* ── Pagination ── */}
+        {!loading && totalPages > 1 && (
+          <div className="flex items-center justify-center gap-1 pt-1">
+            <button
+              disabled={page === 1}
+              onClick={() => setPage(p => p - 1)}
+              className="btn-ghost text-xs px-3 disabled:opacity-30 flex items-center gap-1"
+            >
+              <ArrowLeftCircle size={13} /> Prev
+            </button>
+
+            {pageNumbers.map((p, i) =>
+              typeof p === 'number' ? (
+                <button key={i} onClick={() => setPage(p)}
+                  className={`w-7 h-7 rounded text-xs font-medium transition-colors ${page === p ? 'bg-green-600 text-white' : 'text-gray-400 hover:bg-gray-800 hover:text-white'}`}>
+                  {p}
+                </button>
+              ) : (
+                <span key={i} className="text-gray-600 text-xs px-1">{p}</span>
+              )
+            )}
+
+            <button
+              disabled={page === totalPages}
+              onClick={() => setPage(p => p + 1)}
+              className="btn-ghost text-xs px-3 disabled:opacity-30 flex items-center gap-1"
+            >
+              Next <ArrowRightCircle size={13} />
+            </button>
+          </div>
+        )}
+      </div>
+    </>
   )
 }
 

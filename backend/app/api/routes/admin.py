@@ -1,6 +1,6 @@
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -21,7 +21,7 @@ from app.schemas.parking import (
     SlotOut, OverrideSlotRequest, GateCommand,
     AdminSessionOut, OccupiedSlotOut,
 )
-from app.schemas.wallet import TransactionOut
+from app.schemas.wallet import AdminTransactionOut, AdminTransactionListOut
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -402,20 +402,93 @@ async def gate_control(
 
 # ── Transactions ──────────────────────────────────────────────────────────────
 
-@router.get("/transactions", response_model=list[TransactionOut])
+@router.get("/transactions", response_model=AdminTransactionListOut)
 def list_transactions(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, le=500),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    status: str | None = Query(None, description="Filter by payment status: success | failed | pending"),
+    txn_type: str | None = Query(None, description="Filter by type: credit | debit"),
+    vehicle: str | None = Query(None, description="Search by vehicle plate (partial match)"),
+    date_from: str | None = Query(None, description="Start date ISO format: YYYY-MM-DD"),
+    date_to: str | None = Query(None, description="End date ISO format: YYYY-MM-DD"),
     db: Session = Depends(get_db),
     _admin: User = Depends(get_current_admin),
 ):
-    return (
+    filters = []
+
+    if status:
+        filters.append(Transaction.status == status)
+    if txn_type:
+        filters.append(Transaction.transaction_type == txn_type)
+    if date_from:
+        try:
+            dt = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            filters.append(Transaction.created_at >= dt)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt = datetime.strptime(date_to, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+            filters.append(Transaction.created_at < dt)
+        except ValueError:
+            pass
+    if vehicle:
+        matching_ids = (
+            db.query(ParkingSession.id)
+            .filter(ParkingSession.license_plate_raw.ilike(f"%{vehicle}%"))
+            .subquery()
+        )
+        filters.append(Transaction.session_id.in_(matching_ids))
+
+    total: int = (
+        db.query(func.count(Transaction.id))
+        .filter(*filters)
+        .scalar() or 0
+    )
+
+    offset = (page - 1) * limit
+    txns = (
         db.query(Transaction)
+        .filter(*filters)
+        .options(
+            joinedload(Transaction.user),
+            joinedload(Transaction.session).joinedload(ParkingSession.slot),
+        )
         .order_by(Transaction.created_at.desc())
-        .offset(skip)
+        .offset(offset)
         .limit(limit)
         .all()
     )
+
+    def _fname(path: str | None) -> str | None:
+        return path.split("/")[-1] if path else None
+
+    result: list[AdminTransactionOut] = []
+    for t in txns:
+        s = t.session
+        result.append(AdminTransactionOut(
+            id=t.id,
+            reference_id=t.reference_id,
+            amount=t.amount,
+            transaction_type=t.transaction_type,
+            payment_status=t.status,
+            description=t.description,
+            created_at=t.created_at,
+            user_id=t.user_id,
+            user_name=t.user.name if t.user else None,
+            user_email=t.user.email if t.user else None,
+            session_id=t.session_id,
+            vehicle_number=s.license_plate_raw if s else None,
+            entry_time=s.entry_time if s else None,
+            exit_time=s.exit_time if s else None,
+            duration_minutes=s.duration_minutes if s else None,
+            parking_slot=s.slot.slot_number if s and s.slot else None,
+            entry_image=_fname(s.entry_image_path) if s else None,
+            exit_image=_fname(s.exit_image_path) if s else None,
+            session_status=s.status if s else None,
+        ))
+
+    return AdminTransactionListOut(total=total, page=page, limit=limit, transactions=result)
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────

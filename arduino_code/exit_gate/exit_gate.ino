@@ -1,7 +1,21 @@
 /*
- * Smart Parking System — EXIT GATE Firmware v3.0
- * Hardware : ESP32-CAM (AI-Thinker) + IR Sensor + SG90 Servo
- * Strategy : Event-driven. Camera is OFF until IR fires. No streaming.
+ * Smart Parking System — EXIT GATE Firmware v4.0
+ * Architecture : Server-as-Master / ESP32-as-Slave
+ * Hardware     : ESP32-CAM (AI-Thinker) + IR Sensor + SG90 Servo
+ *
+ * Role change from v3:
+ *   v3 (wrong): ESP32 captures + POSTs image → server decides → ESP32 acts
+ *   v4 (correct): ESP32 signals trigger → server fetches image → server decides → server commands gate
+ *
+ * ESP32 exposes an HTTP server (port 80) with three endpoints:
+ *   GET  /capture  — returns buffered JPEG (captured at IR trigger time)
+ *   POST /gate     — {"action":"open"|"close"} — controls servo
+ *   GET  /status   — device health JSON
+ *
+ * On boot: registers device IP with server via POST /api/iot/register
+ * On IR  : captures image to PSRAM buffer, then fires lightweight trigger
+ *          POST /api/iot/trigger {"device_id":"exit","ip":"<self IP>"}
+ *          Server responds 202, then calls back /capture and /gate asynchronously.
  *
  * Libraries (Arduino Library Manager):
  *   • ArduinoJson by Benoit Blanchon v6.x
@@ -13,21 +27,24 @@
 #include "soc/rtc_cntl_reg.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 
 // ── User Config ───────────────────────────────────────────────────────────────
-#define WIFI_SSID      "Projects"
-#define WIFI_PASSWORD  "12345678@"
+#define WIFI_SSID       "Projects"
+#define WIFI_PASSWORD   "12345678@"
+#define SERVER_BASE_URL "http://192.168.1.16:8000"
 
-// Replace 192.168.x.x with your FastAPI server's local IP after running backend
-#define BACKEND_URL    "http://192.168.1.16:8000/api/esp32/exit-event"
+// Device identity — exit gate differs from entry only here and in servo angles
+#define DEVICE_ID   "exit"
+#define GATE_TYPE   "exit"
 
 // ── Pin Definitions ───────────────────────────────────────────────────────────
-#define IR_SENSOR_PIN   14   // Safe GPIO on AI-Thinker (not shared with camera)
-#define SERVO_PWM_PIN   15   // Safe GPIO for PWM output
-#define LED_FLASH_PIN    4   // Onboard flash — kept LOW always to reduce heat
+#define IR_SENSOR_PIN   14
+#define SERVO_PWM_PIN   15
+#define LED_FLASH_PIN    4   // kept LOW always
 
-// ── AI-Thinker Camera Pins (fixed layout — do not change) ────────────────────
+// ── AI-Thinker Camera Pins (fixed layout) ────────────────────────────────────
 #define PWDN_GPIO_NUM   32
 #define RESET_GPIO_NUM  -1
 #define XCLK_GPIO_NUM    0
@@ -45,73 +62,98 @@
 #define HREF_GPIO_NUM   23
 #define PCLK_GPIO_NUM   22
 
-// ── Gate & Servo ──────────────────────────────────────────────────────────────
+// ── Gate & Servo — exit gate opens the opposite way from entry ────────────────
 #define GATE_OPEN_ANGLE    0
 #define GATE_CLOSE_ANGLE  90
-#define GATE_OPEN_MS    5000   // Auto-close timeout (ms)
+#define GATE_OPEN_MS    5000
 #define SERVO_MIN_US     500
 #define SERVO_MAX_US    2500
-#define SERVO_FREQ        50   // Standard servo: 50 Hz
+#define SERVO_FREQ        50
 
 // ── IR Sensor ─────────────────────────────────────────────────────────────────
-#define IR_ACTIVE_STATE  LOW   // Most IR modules pull LOW when blocked
-#define IR_SAMPLES         3   // Majority-vote across 3 reads
-#define IR_DEBOUNCE_MS    60   // Total debounce window (spread across samples)
-#define ZONE_CLEAR_MS   1500   // Time sensor must be clear before resetting
+#define IR_ACTIVE_STATE  LOW
+#define IR_SAMPLES         3
+#define IR_DEBOUNCE_MS    60
+#define ZONE_CLEAR_MS   1500
 
 // ── Network ───────────────────────────────────────────────────────────────────
-#define HTTP_TIMEOUT_MS  8000
-#define HTTP_RETRY_MAX       2   // Retry once on connection failure
+#define HTTP_TIMEOUT_TRIGGER_MS  3000
+#define HTTP_TIMEOUT_REGISTER_MS 5000
+#define WEBSERVER_PORT             80
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Frame buffer (PSRAM) ──────────────────────────────────────────────────────
+static uint8_t* g_frame_buf  = nullptr;
+static size_t   g_frame_len  = 0;
+static bool     g_frame_ready = false;
+
+// ── Gate state ────────────────────────────────────────────────────────────────
+static bool          gateOpen     = false;
+static unsigned long gateOpenedMs = 0;
+
+// ── IR state ──────────────────────────────────────────────────────────────────
 static bool          vehiclePresent = false;
-static bool          gateOpen       = false;
 static unsigned long lastDetectMs   = 0;
-static unsigned long gateOpenedMs   = 0;
+
+// ── HTTP server (slave endpoints) ────────────────────────────────────────────
+WebServer server(WEBSERVER_PORT);
 
 // ── Prototypes ────────────────────────────────────────────────────────────────
-void connectWiFi();
-bool initCamera();
-bool captureAndSend(String& outStatus);
-bool postImage(const uint8_t* buf, size_t len, String& outStatus);
-void controlGate(bool open);
-bool readIR();
+void  connectWiFi();
+bool  initCamera();
+bool  captureToBuffer();
+void  sendTrigger();
+void  registerWithServer();
+void  controlGate(bool open);
+bool  readIR();
+void  handleCapture();
+void  handleGate();
+void  handleStatus();
+
 
 // =============================================================================
 // SETUP
 // =============================================================================
 
 void setup() {
-  // Brownout disabled: camera init causes a brief current spike that triggers
-  // the brownout detector on boards without adequate decoupling.
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
-  Serial.println("\n=== EXIT GATE v3.0 — Event-Driven ===");
+  Serial.println("\n=== EXIT GATE v4.0 — Slave Mode ===");
 
   pinMode(LED_FLASH_PIN, OUTPUT);
-  digitalWrite(LED_FLASH_PIN, LOW);  // Flash OFF — single biggest heat source
-
+  digitalWrite(LED_FLASH_PIN, LOW);
   pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
 
-  // Servo: attach LEDC channel, close gate on boot
   if (!ledcAttach(SERVO_PWM_PIN, SERVO_FREQ, 16)) {
-    Serial.println("[ERROR] LEDC attach failed — check SERVO_PWM_PIN");
+    Serial.println("[ERROR] LEDC attach failed");
   }
   controlGate(false);
 
   connectWiFi();
 
-  Serial.println("=== System ready — camera OFF, monitoring IR ===");
-  Serial.printf("[PINS] IR: GPIO%d | Servo: GPIO%d\n", IR_SENSOR_PIN, SERVO_PWM_PIN);
+  // ── Start slave HTTP server ───────────────────────────────────────────────
+  server.on("/capture", HTTP_GET,  handleCapture);
+  server.on("/gate",    HTTP_POST, handleGate);
+  server.on("/status",  HTTP_GET,  handleStatus);
+  server.begin();
+  Serial.printf("[HTTP] Slave server listening on port %d\n", WEBSERVER_PORT);
+
+  // ── Register with master ──────────────────────────────────────────────────
+  registerWithServer();
+
+  Serial.println("=== Ready — monitoring IR, serving HTTP ===");
 }
+
 
 // =============================================================================
 // MAIN LOOP
 // =============================================================================
 
 void loop() {
-  // ── Auto-close gate after timeout ────────────────────────────────────────
+  // Service slave HTTP endpoints first (server is master — it calls us)
+  server.handleClient();
+
+  // Auto-close gate after timeout
   if (gateOpen && (millis() - gateOpenedMs >= GATE_OPEN_MS)) {
     controlGate(false);
     Serial.println("[GATE] Auto-closed");
@@ -119,158 +161,240 @@ void loop() {
 
   bool detected = readIR();
 
-  // ── Rising edge: new vehicle arrives ─────────────────────────────────────
+  // Rising edge: vehicle arrives at exit
   if (detected && !vehiclePresent) {
     vehiclePresent = true;
     lastDetectMs   = millis();
 
     Serial.println("──────────────────────────────────");
-    Serial.println("[IR] TRIGGERED — vehicle detected at exit");
+    Serial.println("[IR] Vehicle detected at exit — capturing");
 
-    String status;
-    bool sent = captureAndSend(status);
-
-    if (sent) {
-      Serial.println("[BACKEND] Response: " + status);
-      if (status == "ALLOW") {
-        controlGate(true);
-      } else {
-        Serial.println("[GATE] DENIED by backend — unpaid/unregistered vehicle");
-      }
+    if (captureToBuffer()) {
+      Serial.printf("[CAM] Frame buffered: %u bytes — notifying server\n", g_frame_len);
+      sendTrigger();
     } else {
-      Serial.println("[ERROR] Capture/send failed — gate stays closed");
+      Serial.println("[CAM] Capture failed — keeping gate closed");
     }
+
     Serial.println("──────────────────────────────────");
   }
 
-  // ── Falling edge: vehicle leaves zone (debounced) ────────────────────────
+  // Falling edge: zone cleared
   if (!detected && vehiclePresent && (millis() - lastDetectMs > ZONE_CLEAR_MS)) {
     vehiclePresent = false;
     Serial.println("[IR] Zone cleared — ready for next vehicle");
   }
 
-  delay(100);  // 10 Hz poll; saves CPU and reduces heat vs tight loop
+  delay(20);   // 50 Hz loop — keeps handleClient() responsive
 }
 
+
 // =============================================================================
-// CAPTURE + SEND
-// Camera is initialized fresh per event and de-initialized after.
-// This guarantees the sensor is cold (no accumulated heat) between events.
+// SLAVE ENDPOINT: GET /capture
 // =============================================================================
 
-bool captureAndSend(String& outStatus) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Not connected — aborting");
-    outStatus = "DENY";
-    return false;
+void handleCapture() {
+  if (!g_frame_ready || !g_frame_buf || g_frame_len == 0) {
+    server.send(404, "text/plain", "No frame available");
+    Serial.println("[HTTP] /capture — no frame");
+    return;
   }
 
-  // Power camera on, configure, and init
+  WiFiClient client = server.client();
+  client.print("HTTP/1.1 200 OK\r\n"
+               "Content-Type: image/jpeg\r\n"
+               "Content-Length: ");
+  client.print((uint32_t)g_frame_len);
+  client.print("\r\n"
+               "Connection: close\r\n"
+               "\r\n");
+
+  const uint8_t* p = g_frame_buf;
+  size_t remaining = g_frame_len;
+  while (remaining > 0) {
+    size_t chunk = (remaining > 1460) ? 1460 : remaining;
+    client.write(p, chunk);
+    p         += chunk;
+    remaining -= chunk;
+  }
+
+  Serial.printf("[HTTP] /capture → %u bytes served\n", g_frame_len);
+}
+
+
+// =============================================================================
+// SLAVE ENDPOINT: POST /gate
+// =============================================================================
+
+void handleGate() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+
+  String body = server.arg("plain");
+  StaticJsonDocument<64> doc;
+  DeserializationError err = deserializeJson(doc, body);
+
+  if (err) {
+    server.send(400, "application/json", "{\"error\":\"bad JSON\"}");
+    Serial.println("[HTTP] /gate — bad JSON");
+    return;
+  }
+
+  const char* action = doc["action"] | "close";
+  bool open = (strcmp(action, "open") == 0);
+  controlGate(open);
+
+  if (open) {
+    g_frame_ready = false;   // event complete — clear buffer
+  }
+
+  server.send(200, "application/json",
+              String("{\"status\":\"ok\",\"gate\":\"") + action + "\"}");
+  Serial.printf("[HTTP] /gate → %s\n", action);
+}
+
+
+// =============================================================================
+// SLAVE ENDPOINT: GET /status
+// =============================================================================
+
+void handleStatus() {
+  String ip = WiFi.localIP().toString();
+  String json =
+    "{\"device_id\":\"" DEVICE_ID "\","
+    "\"gate_type\":\"" GATE_TYPE "\","
+    "\"ip\":\"" + ip + "\","
+    "\"gate_open\":" + (gateOpen ? "true" : "false") + ","
+    "\"frame_ready\":" + (g_frame_ready ? "true" : "false") + ","
+    "\"frame_bytes\":" + String(g_frame_len) + ","
+    "\"heap_free\":" + String(ESP.getFreeHeap()) + ","
+    "\"uptime_ms\":" + String(millis()) + "}";
+
+  server.send(200, "application/json", json);
+}
+
+
+// =============================================================================
+// CAPTURE TO PSRAM BUFFER
+// =============================================================================
+
+bool captureToBuffer() {
   if (!initCamera()) {
     Serial.println("[CAM] Init failed");
-    outStatus = "ERROR";
     return false;
   }
 
-  // Discard first frame — sensor AEC (auto-exposure) needs one frame to settle
   camera_fb_t* stale = esp_camera_fb_get();
   if (stale) esp_camera_fb_return(stale);
-  delay(60);  // ~1 frame at 10MHz XCLK; AEC locks in this window
+  delay(60);
 
-  // Capture the real frame
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("[CAM] Frame buffer get failed");
     esp_camera_deinit();
-    outStatus = "ERROR";
     return false;
   }
 
   Serial.printf("[CAM] Captured %dx%d — %d bytes\n", fb->width, fb->height, fb->len);
 
-  // POST with retry — network can have transient hiccups
-  bool success = false;
-  for (int attempt = 1; attempt <= HTTP_RETRY_MAX; attempt++) {
-    Serial.printf("[HTTP] Attempt %d/%d\n", attempt, HTTP_RETRY_MAX);
-    if (postImage(fb->buf, fb->len, outStatus)) {
-      success = true;
-      break;
-    }
-    if (attempt < HTTP_RETRY_MAX) delay(800);
+  if (g_frame_buf) {
+    free(g_frame_buf);
+    g_frame_buf = nullptr;
   }
+  g_frame_buf = (uint8_t*)ps_malloc(fb->len);
+  if (!g_frame_buf) g_frame_buf = (uint8_t*)malloc(fb->len);
+
+  if (!g_frame_buf) {
+    Serial.println("[CAM] Buffer alloc failed");
+    esp_camera_fb_return(fb);
+    esp_camera_deinit();
+    return false;
+  }
+
+  memcpy(g_frame_buf, fb->buf, fb->len);
+  g_frame_len   = fb->len;
+  g_frame_ready = true;
 
   esp_camera_fb_return(fb);
-
-  // De-init camera: cuts ~150mA draw and resets thermal state for next event
   esp_camera_deinit();
   Serial.println("[CAM] De-initialized (thermal standby)");
-
-  return success;
+  return true;
 }
 
+
 // =============================================================================
-// HTTP POST — multipart/form-data directly from frame buffer
-// No SPIFFS: avoids a flash write + read cycle (~10ms + wear saved per event)
+// SEND TRIGGER — lightweight notification to master (no image)
 // =============================================================================
 
-bool postImage(const uint8_t* imgBuf, size_t imgLen, String& outStatus) {
-  const String boundary = "SmartParkExit";
-  const String partHead = "--" + boundary + "\r\n"
-                          "Content-Disposition: form-data; name=\"image\"; filename=\"plate.jpg\"\r\n"
-                          "Content-Type: image/jpeg\r\n\r\n";
-  const String partTail = "\r\n--" + boundary + "--\r\n";
-
-  size_t   totalLen = partHead.length() + imgLen + partTail.length();
-  uint8_t* body     = (uint8_t*)malloc(totalLen);
-  if (!body) {
-    Serial.println("[HTTP] malloc failed — not enough heap");
-    outStatus = "ERROR";
-    return false;
+void sendTrigger() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[TRIGGER] WiFi not connected — skipping");
+    return;
   }
 
-  // Assemble multipart body in one contiguous buffer
-  size_t offset = 0;
-  memcpy(body + offset, partHead.c_str(), partHead.length()); offset += partHead.length();
-  memcpy(body + offset, imgBuf,           imgLen);            offset += imgLen;
-  memcpy(body + offset, partTail.c_str(), partTail.length());
+  StaticJsonDocument<128> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["ip"]        = WiFi.localIP().toString();
+  String body;
+  serializeJson(doc, body);
 
   HTTPClient http;
-  http.begin(BACKEND_URL);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+  http.begin(SERVER_BASE_URL "/api/iot/trigger");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(HTTP_TIMEOUT_TRIGGER_MS);
 
-  int code = http.POST(body, totalLen);
-  free(body);
-
-  if (code <= 0) {
-    Serial.printf("[HTTP] Connection error: %s\n", http.errorToString(code).c_str());
-    http.end();
-    outStatus = "ERROR";
-    return false;
+  int code = http.POST(body);
+  if (code == 200 || code == 202) {
+    Serial.printf("[TRIGGER] Acknowledged (HTTP %d) — master is orchestrating\n", code);
+  } else if (code > 0) {
+    Serial.printf("[TRIGGER] Unexpected HTTP %d\n", code);
+  } else {
+    Serial.printf("[TRIGGER] Connection error: %s\n", http.errorToString(code).c_str());
   }
-
-  String response = http.getString();
   http.end();
-  Serial.printf("[HTTP] %d — %s\n", code, response.c_str());
-
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, response) != DeserializationError::Ok) {
-    Serial.println("[HTTP] JSON parse failed — raw: " + response);
-    outStatus = "ERROR";
-    return false;
-  }
-
-  outStatus = doc["status"].as<String>();
-  return (outStatus == "ALLOW" || outStatus == "DENY");
 }
 
+
 // =============================================================================
-// CAMERA INIT — Optimized settings
+// REGISTER WITH MASTER SERVER
+// =============================================================================
+
+void registerWithServer() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  StaticJsonDocument<128> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["gate_type"] = GATE_TYPE;
+  doc["ip"]        = WiFi.localIP().toString();
+  doc["port"]      = WEBSERVER_PORT;
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  http.begin(SERVER_BASE_URL "/api/iot/register");
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(HTTP_TIMEOUT_REGISTER_MS);
+
+  int code = http.POST(body);
+  if (code > 0) {
+    Serial.printf("[REGISTER] Registered with server (HTTP %d)\n", code);
+    Serial.printf("[REGISTER] IP: %s, device_id: %s\n",
+                  WiFi.localIP().toString().c_str(), DEVICE_ID);
+  } else {
+    Serial.printf("[REGISTER] Failed: %s\n", http.errorToString(code).c_str());
+  }
+  http.end();
+}
+
+
+// =============================================================================
+// CAMERA INIT
 // =============================================================================
 
 bool initCamera() {
   camera_config_t cfg = {};
-
   cfg.ledc_channel = LEDC_CHANNEL_0;
   cfg.ledc_timer   = LEDC_TIMER_0;
   cfg.pin_d0  = Y2_GPIO_NUM;  cfg.pin_d1 = Y3_GPIO_NUM;
@@ -285,51 +409,31 @@ bool initCamera() {
   cfg.pin_sscb_scl = SIOC_GPIO_NUM;
   cfg.pin_pwdn     = PWDN_GPIO_NUM;
   cfg.pin_reset    = RESET_GPIO_NUM;
-
-  // 10 MHz (default is 20 MHz): halves sensor clock, cuts ~30% heat,
-  // still produces clean frames for license plate OCR at this resolution.
   cfg.xclk_freq_hz = 10000000;
-
   cfg.pixel_format = PIXFORMAT_JPEG;
-
-  // CIF 352×288: ~40% smaller payload than VGA, still sufficient for
-  // license plate OCR. Upgrade to FRAMESIZE_VGA if accuracy drops
-  // in poor lighting.
   cfg.frame_size   = FRAMESIZE_CIF;
-
-  // Quality 12: aggressive JPEG compression (~8–20 KB per frame).
-  // Lower = smaller file = faster upload. Vision OCR handles Q12 well.
-  // Go to 10 for faster upload, 15 if OCR misreads characters.
   cfg.jpeg_quality = 12;
+  cfg.fb_count     = 1;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
-  // 1 buffer + GRAB_LATEST: always get the most recent sensor frame,
-  // minimal RAM footprint. fb_count=2 only needed for streaming.
-  cfg.fb_count  = 1;
-  cfg.grab_mode = CAMERA_GRAB_LATEST;
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
 
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    return false;
-  }
-
-  // Disable DSP post-processing: sharpening + denoising add ~5 ms/frame
-  // and extra heat with no benefit for OCR on still captures.
   sensor_t* s = esp_camera_sensor_get();
   if (s) {
-    s->set_whitebal(s, 1);       // Auto white balance — needed for varied lighting
-    s->set_awb_gain(s, 1);       // AWB gain on
-    s->set_exposure_ctrl(s, 1);  // Auto exposure — essential for outdoor use
-    s->set_aec2(s, 0);           // AEC DSP off — single frame, not video
-    s->set_gain_ctrl(s, 1);      // Auto gain on
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 0);
+    s->set_gain_ctrl(s, 1);
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
-    s->set_sharpness(s, 0);      // Sharpening DSP off — saves heat + time
-    s->set_denoise(s, 0);        // Denoise DSP off
+    s->set_sharpness(s, 0);
+    s->set_denoise(s, 0);
   }
-
-  Serial.println("[CAM] Init OK — CIF 352×288, Q12, 10 MHz XCLK");
   return true;
 }
+
 
 // =============================================================================
 // SERVO GATE CONTROL
@@ -338,11 +442,10 @@ bool initCamera() {
 void controlGate(bool open) {
   int angle = open ? GATE_OPEN_ANGLE : GATE_CLOSE_ANGLE;
   int pulse = map(angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
-  // LEDC 16-bit at 50 Hz: period = 20 ms = 20000 µs
   int duty  = (int)((long)pulse * 65535L / 20000L);
 
   ledcWrite(SERVO_PWM_PIN, duty);
-  delay(350);  // Give servo time to reach position before state update
+  delay(350);
 
   gateOpen = open;
   if (open) gateOpenedMs = millis();
@@ -350,10 +453,9 @@ void controlGate(bool open) {
   Serial.printf("[SERVO] Gate %s (%d°)\n", open ? "OPEN" : "CLOSED", angle);
 }
 
+
 // =============================================================================
 // IR SENSOR — Majority-vote debounce
-// 3 reads within IR_DEBOUNCE_MS window; 2/3 must agree to report detected.
-// Prevents single-noise spikes from triggering a capture event.
 // =============================================================================
 
 bool readIR() {
@@ -365,6 +467,7 @@ bool readIR() {
   return (hits >= (IR_SAMPLES / 2 + 1));
 }
 
+
 // =============================================================================
 // WIFI
 // =============================================================================
@@ -372,21 +475,16 @@ bool readIR() {
 void connectWiFi() {
   Serial.print("[WiFi] Connecting to " WIFI_SSID);
   WiFi.mode(WIFI_STA);
-
-  // 15 dBm: adequate for home/office LAN, ~25% less power than 20 dBm max.
-  // Reduces WiFi module heat without affecting throughput on a local network.
   WiFi.setTxPower(WIFI_POWER_15dBm);
-
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("[WiFi] Connected — IP: " + WiFi.localIP().toString());
   } else {
-    Serial.println("[WiFi] FAILED — check SSID/password. System runs in offline mode.");
+    Serial.println("[WiFi] FAILED — running in offline mode");
   }
 }
