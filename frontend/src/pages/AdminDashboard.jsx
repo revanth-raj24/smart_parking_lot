@@ -31,10 +31,12 @@ const TABS = [
 ]
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
+
 function imgUrl(path) {
   if (!path) return null
   const fname = path.includes('/') ? path.split('/').pop() : path
-  return `/images/${fname}`
+  return `${API_BASE}/images/${fname}`
 }
 
 function liveDuration(entryTime) {
@@ -45,7 +47,7 @@ function liveDuration(entryTime) {
 
 // ── Captured Image Card (replaces live-stream CameraFeed) ────────────────────
 function CapturedImageCard({ label, imageName, captureTime, plate }) {
-  const url = imageName ? `/images/${imageName}` : null
+  const url = imageName ? imgUrl(imageName) : null
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-3">

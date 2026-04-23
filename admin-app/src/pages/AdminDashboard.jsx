@@ -31,10 +31,12 @@ const TABS = [
   { id: 'testing',      label: 'Testing',      icon: FlaskConical },
 ]
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
+
 function imgUrl(path) {
   if (!path) return null
   const fname = path.includes('/') ? path.split('/').pop() : path
-  return `/images/${fname}`
+  return `${API_BASE}/images/${fname}`
 }
 
 function liveDuration(entryTime) {
@@ -45,7 +47,7 @@ function liveDuration(entryTime) {
 
 // ── Captured Image Card ───────────────────────────────────────────────────────
 function CapturedImageCard({ label, imageName, captureTime, plate }) {
-  const url = imageName ? `/images/${imageName}` : null
+  const url = imageName ? imgUrl(imageName) : null
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-3">
@@ -714,9 +716,9 @@ function TransactionModal({ txn, onClose }) {
                     <div key={side}>
                       <p className="text-[11px] text-gray-500 mb-1.5 capitalize">{side} Image</p>
                       {imgFile ? (
-                        <a href={`/images/${imgFile}`} target="_blank" rel="noreferrer" className="group block">
+                        <a href={imgUrl(imgFile)} target="_blank" rel="noreferrer" className="group block">
                           <img
-                            src={`/images/${imgFile}`}
+                            src={imgUrl(imgFile)}
                             alt={`${side} capture`}
                             className="w-full h-40 object-cover rounded-xl border border-gray-700 group-hover:opacity-90 transition-opacity"
                             onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
@@ -1090,7 +1092,7 @@ function CameraTab() {
               className="group relative rounded-xl overflow-hidden border border-gray-800 bg-gray-900 cursor-pointer hover:border-green-700 transition-colors"
               onClick={() => setLightbox(c)}>
               <img
-                src={`/images/${c.image}`}
+                src={imgUrl(c.image)}
                 alt={`${c.type} ${c.plate}`}
                 className="w-full h-36 object-cover group-hover:opacity-90 transition-opacity"
                 onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex' }}
@@ -1118,7 +1120,7 @@ function CameraTab() {
             <button onClick={() => setLightbox(null)} className="absolute -top-10 right-0 text-gray-400 hover:text-white transition-colors">
               <X size={24} />
             </button>
-            <img src={`/images/${lightbox.image}`} alt={lightbox.plate} className="w-full rounded-xl" />
+            <img src={imgUrl(lightbox.image)} alt={lightbox.plate} className="w-full rounded-xl" />
             <div className="mt-3 flex items-center justify-between">
               <div>
                 <span className={`text-xs font-bold px-2 py-1 rounded mr-2 ${lightbox.type === 'entry' ? 'bg-green-700 text-green-100' : 'bg-blue-700 text-blue-100'}`}>
@@ -1131,7 +1133,7 @@ function CameraTab() {
                 <p className="text-gray-600 text-xs">Session #{lightbox.session_id}</p>
               </div>
             </div>
-            <a href={`/images/${lightbox.image}`} target="_blank" rel="noreferrer"
+            <a href={imgUrl(lightbox.image)} target="_blank" rel="noreferrer"
               className="mt-2 inline-flex items-center gap-1 text-xs text-green-500 hover:text-green-400">
               <ExternalLink size={11} /> Open full size
             </a>
