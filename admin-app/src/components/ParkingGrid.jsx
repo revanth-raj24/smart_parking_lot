@@ -1,6 +1,9 @@
 import SlotCard from './SlotCard'
 
 export default function ParkingGrid({ slots }) {
+  const sorted = [...slots].sort((a, b) =>
+    parseInt(a.slot_number.replace(/\D/g, '')) - parseInt(b.slot_number.replace(/\D/g, ''))
+  )
   const available = slots.filter(s => s.status === 'available').length
   const occupied  = slots.filter(s => s.status === 'occupied').length
   const reserved  = slots.filter(s => s.status === 'reserved').length
@@ -22,7 +25,7 @@ export default function ParkingGrid({ slots }) {
         </span>
       </div>
       <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-3">
-        {slots.map(slot => <SlotCard key={slot.id} slot={slot} />)}
+        {sorted.map(slot => <SlotCard key={slot.id} slot={slot} />)}
       </div>
     </div>
   )

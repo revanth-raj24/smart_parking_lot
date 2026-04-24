@@ -125,6 +125,12 @@ export default function Wallet() {
           <p className="text-xs text-yellow-500 mt-2">
             Demo mode — no real payment processed
           </p>
+
+          <div className="mt-6 flex flex-col items-center gap-2">
+            <p className="text-sm text-gray-400">Or pay via UPI</p>
+            <img src="/qrcode.jpeg" alt="UPI QR Code" className="w-56 h-56 rounded-xl object-contain" />
+            <p className="text-xs text-gray-500">UPI ID: mohanrmohan2345@oksbi</p>
+          </div>
         </div>
 
         {/* Transaction history */}
