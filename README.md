@@ -1,6 +1,6 @@
 # Smart Parking System
 
-An automated parking management system with IoT-based license plate recognition, real-time slot tracking, and wallet-based billing.
+An automated parking management system with IoT-based license plate recognition, real-time slot tracking, wallet-based billing, and advance slot pre-booking.
 
 Vehicles are identified at entry and exit by ESP32-CAM modules. The device captures a JPEG, pushes it to the backend, which runs OCR via a vision LLM and responds synchronously with `open` or `close`. No polling — the ESP32 controls its own servo based on the server response.
 
@@ -12,8 +12,9 @@ Vehicles are identified at entry and exit by ESP32-CAM modules. The device captu
 - **Vision-based OCR** — License plate extraction via OpenRouter (Gemini 2.5 Flash Lite) with retry logic
 - **Device registry** — ESP32s register their DHCP IP on boot and send heartbeats every 20s; backend marks devices offline after 60s of silence
 - **Real-time slot grid** — Live availability dashboard for both users and admins (P1–P11)
+- **Pre-booking system** — Reserve any slot for a future date and time window; overlap-aware conflict detection prevents double bookings
 - **Wallet billing** — Prepaid balance; ₹60 first hour + ₹30 per additional hour; auto-deducted on exit; denied if balance is insufficient
-- **Admin dashboard** — Sessions, user management, slot overrides, captures gallery, transactions, gate control, hardware simulation, analytics
+- **Admin dashboard** — Sessions, user management, slot overrides, captures gallery, transactions, pre-bookings, gate control, hardware simulation, analytics
 - **JWT authentication** — Role-based (user / admin) with origin-guard middleware
 - **Rate limiting** — 200 req/min per IP via SlowAPI
 
@@ -31,6 +32,7 @@ Vehicles are identified at entry and exit by ESP32-CAM modules. The device captu
 │  Exit ESP32-CAM     │ ───────────────────────────────►  │  • OCR via OpenRouter│
 │  (IR + Servo + LED) │ ◄────── {"action":"open|close"} ─ │  • JWT auth          │
 └─────────────────────┘                                    │  • Wallet billing    │
+                                                           │  • Pre-booking       │
                                                            └──────────┬───────────┘
                                                                       │  REST API
                                ┌─────────────────────┐               │
@@ -66,13 +68,13 @@ Vehicles are identified at entry and exit by ESP32-CAM modules. The device captu
 smart-parking/
 ├── backend/                  # FastAPI application
 │   ├── app/
-│   │   ├── api/routes/       # auth, parking, wallet, admin, devices, iot, esp32
+│   │   ├── api/routes/       # auth, parking, wallet, admin, devices, iot, esp32, prebook
 │   │   ├── core/             # config, JWT, deps
 │   │   ├── db/               # database, seed
-│   │   ├── models/           # SQLAlchemy ORM models
+│   │   ├── models/           # SQLAlchemy ORM models (incl. PreBooking)
 │   │   ├── schemas/          # Pydantic request/response schemas
-│   │   └── services/         # OCR, billing, parking logic, device service
-│   ├── alembic/              # DB migrations
+│   │   └── services/         # OCR, billing, parking logic, device service, prebooking service
+│   ├── alembic/              # DB migrations (0001–0004)
 │   ├── main.py
 │   ├── requirements.txt
 │   └── .env.example
@@ -108,10 +110,29 @@ smart-parking/
 ### Parking — `/api/parking`
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/slots` | JWT | All slots with status |
-| POST | `/book-slot` | JWT | Manual slot reservation |
+| GET | `/slots` | Public | All slots with live status |
+| POST | `/book-slot` | JWT | Instant slot reservation |
 | GET | `/my-sessions` | JWT | Parking history (last 50) |
 | GET | `/active-session` | JWT | Current active session |
+
+### Pre-Booking — `/api/prebook`
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/` | JWT | Reserve a slot for a future date/time window |
+| GET | `/my` | JWT | List current user's pre-bookings |
+| DELETE | `/{id}` | JWT | Cancel a pre-booking |
+
+**Conflict rule:** a new booking is rejected if any active booking for the same slot on the same date satisfies `existing_start < new_end AND existing_end > new_start`.
+
+**Request body for `POST /api/prebook`:**
+```json
+{
+  "slot_id": "P3",
+  "date": "2026-05-01",
+  "start_time": "10:00",
+  "end_time": "12:00"
+}
+```
 
 ### Wallet — `/api/wallet`
 | Method | Path | Auth | Description |
@@ -137,12 +158,14 @@ smart-parking/
 |--------|------|-------------|
 | GET | `/users` | List all users |
 | GET/PATCH/DELETE | `/users/{id}` | View, edit, or delete user |
-| GET | `/users/{id}/detail` | Full user detail with sessions |
+| GET | `/users/{id}/detail` | Full user detail with sessions and wallet |
 | POST | `/users/{id}/wallet/credit` | Manually credit wallet |
 | GET | `/sessions` | All sessions (filterable by status / plate) |
 | PATCH | `/sessions/{id}/close` | Force-close an active session |
 | GET | `/slots/occupied` | Occupied slots with tenant info |
 | POST | `/override` | Override a slot's status |
+| GET | `/prebookings` | All pre-bookings with user details |
+| DELETE | `/prebookings/{id}` | Cancel any pre-booking (admin) |
 | GET | `/latest-captures` | Most recent entry/exit images |
 | GET | `/captures` | Full captures gallery |
 | POST | `/gate-control` | Send open/close to ESP32 |
@@ -153,7 +176,7 @@ smart-parking/
 
 ### Health
 ```
-GET /api/health   →  {"status": "ok"}
+GET /api/health   →  {"status": "ok", "version": "3.0.0"}
 ```
 
 ---
@@ -166,6 +189,24 @@ GET /api/health   →  {"status": "ok"}
 | Each additional hour | ₹30 |
 
 Fee is deducted automatically at exit. If wallet balance is insufficient the exit is denied and logged as a `denied` session.
+
+> **Pre-bookings do not deduct the wallet.** Payment is charged only when the vehicle physically parks and exits through the IoT gate.
+
+---
+
+## Pre-Booking Flow
+
+```
+User selects slot → switches to "Pre-Book" mode → clicks slot
+→ picks date + start time + end time
+→ backend checks for overlapping active bookings
+→ booking saved (or 409 Conflict returned)
+→ "My Bookings" page shows all reservations with cancel option
+```
+
+Admin can view and cancel all pre-bookings from the **Pre-Bookings** tab in the admin dashboard.
+
+Pre-bookings are independent of the physical IoT pipeline — a pre-booked slot is not locked in the `parking_slots` table. The IoT entry flow remains unchanged.
 
 ---
 
@@ -188,25 +229,26 @@ cd smart-parking
 ```bash
 cd backend
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
 cp .env.example .env
 # Edit .env — set DATABASE_URL, SECRET_KEY, OPENROUTER_API_KEY
 
-alembic upgrade head
-python -m app.db.seed   # creates admin account + 11 slots (P1–P11)
+alembic upgrade head            # runs all 4 migrations including prebookings table
+python -m app.db.seed           # creates admin account + 11 slots (P1–P11)
 
-uvicorn main:app --reload --port 6626
+uvicorn main:app --reload --port 8000
 ```
 
-API docs: `http://localhost:6626/api/docs`
+API docs: `http://localhost:8000/docs`
 
 ### 3. User app
 
 ```bash
 cd frontend
 cp .env.example .env
+# Set VITE_API_BASE_URL=http://localhost:8000 in .env
 npm install
 npm run dev   # http://localhost:5173
 ```
@@ -215,7 +257,7 @@ npm run dev   # http://localhost:5173
 
 ```bash
 cd admin-app
-cp .env.example .env
+# Create .env with: VITE_API_BASE_URL=http://localhost:8000
 npm install
 npm run dev   # http://localhost:5174
 ```
@@ -248,13 +290,32 @@ Default admin credentials (set via `ADMIN_SEED_EMAIL` / `ADMIN_SEED_PASSWORD` in
 
 | Variable | Description |
 |---|---|
-| `VITE_ADMIN_APP_URL` | URL to the admin app (shown as a link) |
+| `VITE_API_BASE_URL` | Backend URL e.g. `http://localhost:8000` (empty = use Vite proxy) |
+| `VITE_ENTRY_CAM_URL` | Entry camera MJPEG stream URL |
+| `VITE_EXIT_CAM_URL` | Exit camera MJPEG stream URL |
 
 ### `admin-app/.env`
 
 | Variable | Description |
 |---|---|
-| `VITE_USER_APP_URL` | URL to the user app (shown as a link) |
+| `VITE_API_BASE_URL` | Backend URL e.g. `http://localhost:8000` (empty = use Vite proxy) |
+| `VITE_USER_APP_URL` | URL to the user app (shown as a link in admin panel) |
+
+---
+
+## Database Migrations
+
+| Revision | Description |
+|---|---|
+| `0001` | Initial schema — users, vehicles, parking_slots, parking_sessions, wallet, transactions |
+| `0002` | Add indexes; fix wallet balance precision to `Numeric(10,2)` |
+| `0003` | Add `devices` table for dynamic IoT device registration |
+| `0004` | Add `prebookings` table for advance slot reservation |
+
+Run all migrations:
+```bash
+cd backend && alembic upgrade head
+```
 
 ---
 
@@ -312,7 +373,8 @@ The script installs dependencies, builds both React apps, runs migrations, seeds
 1. Copy the project to the server
 2. Edit `deployment/nginx.conf` — replace placeholder domain/IP
 3. Set all real values in `backend/.env`
-4. Set a strong `ADMIN_SEED_PASSWORD`
+4. Set `VITE_API_BASE_URL=` (empty) in both frontend `.env` files — Nginx proxies `/api` to the backend
+5. Set a strong `ADMIN_SEED_PASSWORD`
 
 **PM2 processes:**
 

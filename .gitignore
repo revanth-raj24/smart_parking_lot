@@ -39,6 +39,7 @@ logs/
 
 # ── Captured images (large binary runtime files) ─────────────────────────────
 backend/captured_images/
+backend/catured-images/
 
 # ── OS artefacts ──────────────────────────────────────────────────────────────
 .DS_Store

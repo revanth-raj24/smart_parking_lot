@@ -3,11 +3,12 @@ import Navbar from '../components/Navbar'
 import ParkingGrid from '../components/ParkingGrid'
 import CameraFeed from '../components/CameraFeed'
 import BookSlotModal from '../components/BookSlotModal'
+import PreBookModal from '../components/PreBookModal'
 import { getSlots, getActiveSession } from '../api/parking'
 import { getBalance } from '../api/wallet'
 import { usePolling } from '../hooks/usePolling'
 import { useAuth } from '../context/AuthContext'
-import { Clock, IndianRupee, Car, RefreshCw } from 'lucide-react'
+import { Clock, IndianRupee, Car, RefreshCw, CalendarDays, Zap } from 'lucide-react'
 
 function ActiveSessionBanner({ session }) {
   const [elapsed, setElapsed] = useState('')
@@ -53,6 +54,8 @@ export default function Dashboard() {
   const [balance, setBalance] = useState(null)
   const [activeSession, setActiveSession] = useState(null)
   const [selectedSlot, setSelectedSlot] = useState(null)
+  const [preBookSlot, setPreBookSlot] = useState(null)
+  const [bookingMode, setBookingMode] = useState('instant') // 'instant' | 'prebook'
   const [lastRefresh, setLastRefresh] = useState(new Date())
 
   const fetchAll = async () => {
@@ -61,7 +64,8 @@ export default function Dashboard() {
       getBalance(),
       getActiveSession(),
     ])
-    if (slotsRes.status === 'fulfilled')   setSlots(slotsRes.value.data)
+    if (slotsRes.status === 'fulfilled' && Array.isArray(slotsRes.value.data))
+      setSlots(slotsRes.value.data)
     if (balRes.status === 'fulfilled')     setBalance(balRes.value.data.balance)
     if (sessionRes.status === 'fulfilled') setActiveSession(sessionRes.value.data)
     setLastRefresh(new Date())
@@ -86,7 +90,7 @@ export default function Dashboard() {
             </p>
           </div>
           <div className="flex items-center gap-4">
-            {balance !== null && (
+            {balance != null && (
               <div className="flex items-center gap-1.5 bg-gray-900 border border-gray-700 px-3 py-2 rounded-lg">
                 <IndianRupee size={14} className="text-green-400" />
                 <span className="font-semibold text-white">{balance.toFixed(2)}</span>
@@ -105,14 +109,44 @@ export default function Dashboard() {
 
         {/* Parking grid */}
         <div className="card">
-          <h2 className="text-lg font-semibold text-gray-100 mb-4">
-            Parking Slots
-            <span className="ml-2 text-sm font-normal text-gray-400">(click an available slot to book)</span>
-          </h2>
+          <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+            <h2 className="text-lg font-semibold text-gray-100">
+              Parking Slots
+              <span className="ml-2 text-sm font-normal text-gray-400">
+                (click an available slot to {bookingMode === 'instant' ? 'book instantly' : 'pre-book'})
+              </span>
+            </h2>
+            {/* Mode toggle */}
+            <div className="flex items-center gap-1 bg-gray-800 p-1 rounded-lg border border-gray-700">
+              <button
+                onClick={() => setBookingMode('instant')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                  bookingMode === 'instant'
+                    ? 'bg-green-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <Zap size={12} /> Instant
+              </button>
+              <button
+                onClick={() => setBookingMode('prebook')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                  bookingMode === 'prebook'
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <CalendarDays size={12} /> Pre-Book
+              </button>
+            </div>
+          </div>
           <ParkingGrid
             slots={slots}
             selectable
-            onBook={(slot) => setSelectedSlot(slot)}
+            onBook={(slot) => {
+              if (bookingMode === 'prebook') setPreBookSlot(slot)
+              else setSelectedSlot(slot)
+            }}
           />
         </div>
 
@@ -147,6 +181,14 @@ export default function Dashboard() {
           slot={selectedSlot}
           onClose={() => setSelectedSlot(null)}
           onSuccess={() => { setSelectedSlot(null); fetchAll() }}
+        />
+      )}
+
+      {preBookSlot && (
+        <PreBookModal
+          slot={preBookSlot}
+          onClose={() => setPreBookSlot(null)}
+          onSuccess={() => setPreBookSlot(null)}
         />
       )}
     </div>

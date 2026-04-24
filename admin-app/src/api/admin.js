@@ -35,3 +35,7 @@ export const adminSimulateExit = (file) => {
 
 // Parking slots (public endpoint — used in admin grid view)
 export const getSlots = () => api.get('/parking/slots')
+
+// Pre-bookings
+export const adminGetPreBookings    = ()   => api.get('/admin/prebookings')
+export const adminCancelPreBooking  = (id) => api.delete(`/admin/prebookings/${id}`)

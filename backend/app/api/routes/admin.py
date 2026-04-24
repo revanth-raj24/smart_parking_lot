@@ -22,6 +22,8 @@ from app.schemas.parking import (
     AdminSessionOut, OccupiedSlotOut,
 )
 from app.schemas.wallet import AdminTransactionOut, AdminTransactionListOut
+from app.schemas.prebooking import AdminPreBookingOut
+from app.services.prebooking_service import get_all_bookings, admin_cancel_booking
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -576,3 +578,26 @@ async def simulate_exit(
     filename = image.filename or "simulate_exit.jpg"
     logger.info(f"[SIM] Exit simulation — {len(image_bytes)} bytes")
     return await _forward_to_esp32_endpoint(request, image_bytes, filename, "api/esp32/exit-event")
+
+
+# ── Pre-Bookings ──────────────────────────────────────────────────────────────
+
+@router.get("/prebookings", response_model=list[AdminPreBookingOut], summary="All pre-bookings")
+def list_prebookings(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_admin),
+):
+    return get_all_bookings(db)
+
+
+@router.delete("/prebookings/{booking_id}", status_code=200, summary="Cancel a pre-booking (admin)")
+def admin_cancel_prebooking(
+    booking_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_admin),
+):
+    booking = admin_cancel_booking(db, booking_id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found or already cancelled")
+    logger.info(f"[ADMIN] Pre-booking {booking_id} cancelled")
+    return {"status": "cancelled", "id": booking_id}

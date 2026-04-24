@@ -9,6 +9,7 @@ import {
   adminGetLatestCaptures, adminGetCaptures, adminGateControl,
   adminGetTransactions,
   adminSimulateEntry, adminSimulateExit,
+  adminGetPreBookings, adminCancelPreBooking,
   getSlots,
 } from '../api/admin'
 import { usePolling } from '../hooks/usePolling'
@@ -19,6 +20,7 @@ import {
   ArrowDownCircle, RefreshCw, Shield, FlaskConical,
   Upload, Loader2, ArrowRightCircle, ArrowLeftCircle,
   Camera, X, Car, Search, Clock, Wallet, ExternalLink, Image,
+  CalendarDays,
 } from 'lucide-react'
 
 const TABS = [
@@ -26,6 +28,7 @@ const TABS = [
   { id: 'slots',        label: 'Slots',        icon: ParkingCircle },
   { id: 'users',        label: 'Users',        icon: Users },
   { id: 'sessions',     label: 'Sessions',     icon: Activity },
+  { id: 'prebookings',  label: 'Pre-Bookings', icon: CalendarDays },
   { id: 'transactions', label: 'Transactions', icon: ArrowDownCircle },
   { id: 'camera',       label: 'Camera',       icon: Image },
   { id: 'testing',      label: 'Testing',      icon: FlaskConical },
@@ -1144,6 +1147,137 @@ function CameraTab() {
   )
 }
 
+// ── Pre-Bookings Tab ──────────────────────────────────────────────────────────
+const PB_STATUS_STYLE = {
+  active:    'bg-green-900/40 text-green-400 border border-green-800/60',
+  cancelled: 'bg-red-900/40  text-red-400  border border-red-800/60',
+}
+const PB_STATUS_FILTERS = [
+  { key: 'all',       label: 'All' },
+  { key: 'active',    label: 'Active' },
+  { key: 'cancelled', label: 'Cancelled' },
+]
+
+function PreBookingsTab() {
+  const [bookings, setBookings]     = useState([])
+  const [loading, setLoading]       = useState(true)
+  const [cancelling, setCancelling] = useState(null)
+  const [statusFilter, setFilter]   = useState('all')
+  const [slotFilter, setSlotFilter] = useState('')
+  const [dateFilter, setDateFilter] = useState('')
+
+  const load = useCallback(() => {
+    setLoading(true)
+    adminGetPreBookings()
+      .then(r => setBookings(r.data))
+      .catch(() => toast.error('Failed to load pre-bookings'))
+      .finally(() => setLoading(false))
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  const handleCancel = async (id) => {
+    if (!confirm('Cancel this pre-booking?')) return
+    setCancelling(id)
+    try {
+      await adminCancelPreBooking(id)
+      toast.success(`Pre-booking #${id} cancelled`)
+      setBookings(bs => bs.map(b => b.id === id ? { ...b, status: 'cancelled' } : b))
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Cancel failed')
+    } finally {
+      setCancelling(null) }
+  }
+
+  const visible = bookings.filter(b => {
+    if (statusFilter !== 'all' && b.status !== statusFilter) return false
+    if (slotFilter && !b.slot_id.toLowerCase().includes(slotFilter.toLowerCase())) return false
+    if (dateFilter && b.booking_date !== dateFilter) return false
+    return true
+  })
+
+  return (
+    <div className="space-y-4">
+      {/* Filters */}
+      <div className="flex flex-wrap gap-3 items-center">
+        <div className="flex gap-1 bg-gray-900 p-1 rounded-lg border border-gray-800">
+          {PB_STATUS_FILTERS.map(f => (
+            <button key={f.key} onClick={() => setFilter(f.key)}
+              className={`px-3 py-1.5 text-xs font-medium rounded transition-colors ${statusFilter === f.key ? 'bg-green-600 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}`}>
+              {f.label}
+            </button>
+          ))}
+        </div>
+        <div className="relative">
+          <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
+          <input className="input pl-7 text-xs w-24" placeholder="Slot…" value={slotFilter} onChange={e => setSlotFilter(e.target.value)} />
+        </div>
+        <input type="date" className="input text-xs" value={dateFilter} onChange={e => setDateFilter(e.target.value)} title="Filter by date" />
+        {(slotFilter || dateFilter) && (
+          <button onClick={() => { setSlotFilter(''); setDateFilter('') }} className="text-xs text-red-400 hover:text-red-300 flex items-center gap-1">
+            <X size={11} /> Clear
+          </button>
+        )}
+        <span className="text-xs text-gray-500 ml-auto">{visible.length} booking{visible.length !== 1 ? 's' : ''}</span>
+        <button onClick={load} className="btn-ghost text-xs flex items-center gap-1"><RefreshCw size={12} /> Refresh</button>
+      </div>
+
+      <div className="card overflow-x-auto">
+        {loading ? (
+          <div className="flex justify-center py-8"><Loader2 size={20} className="animate-spin text-green-400" /></div>
+        ) : visible.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 text-gray-600 gap-2">
+            <CalendarDays size={36} />
+            <p className="text-sm">No pre-bookings found</p>
+          </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-gray-500 border-b border-gray-800">
+                {['#', 'User', 'Email', 'Slot', 'Date', 'Start', 'End', 'Status', 'Created', ''].map(h => (
+                  <th key={h} className="pb-3 pr-3 font-medium whitespace-nowrap">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map(b => (
+                <tr key={b.id} className="border-b border-gray-800/50 hover:bg-gray-800/20 text-xs">
+                  <td className="py-2.5 pr-3 text-gray-500">{b.id}</td>
+                  <td className="py-2.5 pr-3 text-gray-300">{b.user_name ?? `#${b.user_id}`}</td>
+                  <td className="py-2.5 pr-3 text-gray-500">{b.user_email ?? '—'}</td>
+                  <td className="py-2.5 pr-3">
+                    <span className="font-mono font-bold text-green-400 bg-green-900/20 px-2 py-0.5 rounded">{b.slot_id}</span>
+                  </td>
+                  <td className="py-2.5 pr-3 text-gray-300 whitespace-nowrap">{b.booking_date}</td>
+                  <td className="py-2.5 pr-3 text-gray-300">{b.start_time}</td>
+                  <td className="py-2.5 pr-3 text-gray-300">{b.end_time}</td>
+                  <td className="py-2.5 pr-3">
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase whitespace-nowrap ${PB_STATUS_STYLE[b.status] || 'bg-gray-800 text-gray-400'}`}>
+                      {b.status}
+                    </span>
+                  </td>
+                  <td className="py-2.5 pr-3 text-gray-500 whitespace-nowrap">
+                    {new Date(b.created_at).toLocaleDateString()}
+                  </td>
+                  <td className="py-2.5">
+                    {b.status === 'active' && (
+                      <button disabled={cancelling === b.id} onClick={() => handleCancel(b.id)}
+                        className="flex items-center gap-1 px-2 py-1 rounded text-[10px] bg-red-900/40 text-red-400 hover:bg-red-900/70 transition-colors disabled:opacity-40">
+                        {cancelling === b.id ? <Loader2 size={10} className="animate-spin" /> : <X size={10} />}
+                        Cancel
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ── Testing Tab ───────────────────────────────────────────────────────────────
 function ResultCard({ result }) {
   if (!result) return null
@@ -1252,6 +1386,7 @@ export default function AdminDashboard() {
         {tab === 'slots'        && <SlotsTab slots={slots} onRefresh={fetchBase} />}
         {tab === 'users'        && <UsersTab />}
         {tab === 'sessions'     && <SessionsTab />}
+        {tab === 'prebookings'  && <PreBookingsTab />}
         {tab === 'transactions' && <TransactionsTab />}
         {tab === 'camera'       && <CameraTab />}
         {tab === 'testing'      && <TestingTab />}

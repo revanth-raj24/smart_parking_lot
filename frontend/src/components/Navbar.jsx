@@ -1,11 +1,12 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { ParkingCircle, LayoutDashboard, Wallet, User, Shield, LogOut } from 'lucide-react'
+import { ParkingCircle, LayoutDashboard, Wallet, User, Shield, LogOut, CalendarDays } from 'lucide-react'
 
 const userNav = [
-  { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { to: '/wallet',    label: 'Wallet',    icon: Wallet },
-  { to: '/profile',   label: 'Profile',   icon: User },
+  { to: '/dashboard',   label: 'Dashboard',   icon: LayoutDashboard },
+  { to: '/my-bookings', label: 'My Bookings', icon: CalendarDays },
+  { to: '/wallet',      label: 'Wallet',      icon: Wallet },
+  { to: '/profile',     label: 'Profile',     icon: User },
 ]
 
 export default function Navbar() {

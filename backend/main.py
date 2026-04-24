@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.db.database import SessionLocal
 from app.api.routes import auth, parking, wallet, admin, esp32, iot
 from app.api.routes import devices
+from app.api.routes import prebook
 from app.services.device_service import mark_stale_devices_offline
 
 logging.basicConfig(
@@ -205,6 +206,7 @@ app.include_router(auth.router,    prefix="/api/auth",    tags=["auth"])
 app.include_router(parking.router, prefix="/api/parking", tags=["parking"])
 app.include_router(wallet.router,  prefix="/api/wallet",  tags=["wallet"])
 app.include_router(admin.router,   prefix="/api/admin",   tags=["admin"])
+app.include_router(prebook.router, prefix="/api/prebook", tags=["prebook"])
 
 # IoT device registry (register on boot, heartbeat every 20 s)
 app.include_router(devices.router, prefix="/api/devices", tags=["devices"])

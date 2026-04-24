@@ -37,7 +37,7 @@
 // ── User Config ───────────────────────────────────────────────────────────────
 #define WIFI_SSID       "Projects"
 #define WIFI_PASSWORD   "12345678@"
-#define SERVER_BASE_URL "http://192.168.1.16:8000"
+#define SERVER_BASE_URL "http://31.97.231.29:6626"
 
 // Device identity — must be unique across all devices on this server
 #define DEVICE_ID    "entry"
